@@ -239,6 +239,28 @@ async function getJSON(env, key, fallback) {
 const getFilters = (env) => getJSON(env, "filters_v1", { muted: [], linkOnly: [] }); // linkOnly: ["*"] or handles
 const getPendingAdds = (env) => getJSON(env, "pending_adds", []);
 
+// retention for the QUERY feature: last N feed items in one batched KV key (few writes, quota-safe)
+const FEED_ITEMS_KEY = "feed_items";
+const FEED_ITEMS_MAX = 400;
+const getFeedItems = (env) => getJSON(env, FEED_ITEMS_KEY, []);
+const getWatches = (env) => getJSON(env, "watches", []); // [{phrase, at}]
+
+function itemText(t) {
+  return [t.text, t.origText, t.quotedText, t.handle, t.name].filter(Boolean).join(" ").toLowerCase();
+}
+const QUERY_STOP = new Set("about anything heard what whats the and for are was did does know tell hey buff bot any some something news update updates on of in is it there say said who that this with from latest recently stuff thing things you".split(" "));
+function queryTerms(text) {
+  return [...new Set(text.toLowerCase().replace(/[^a-z0-9@_ ]/g, " ").split(/\s+/).filter((s) => s.length >= 3 && !QUERY_STOP.has(s)))];
+}
+function watchHit(t, watches) {
+  const body = itemText(t);
+  for (const watch of watches) {
+    const terms = watch.phrase.toLowerCase().split(/\s+/).filter(Boolean);
+    if (terms.length && terms.every((term) => body.includes(term))) return watch;
+  }
+  return null;
+}
+
 function isLinkOnly(t) {
   const hasLink = /https?:\/\/t\.co\/\w+/.test(t.text);
   return hasLink && !t.media.length && stripLinks(t.text).length === 0;
@@ -288,6 +310,8 @@ async function poll(env) {
   const tweets = extractTweets(payload);
   const byId = new Map(tweets.map((t) => [t.id, t]));
   const filters = await getFilters(env);
+  const watches = await getWatches(env);
+  const retained = []; // pushed into feed_items at the end (one batched write)
 
   // pending adds: confirm once a staged account actually shows up in the list timeline
   const pendingAdds = await getPendingAdds(env);
@@ -316,12 +340,18 @@ async function poll(env) {
       continue;
     }
     if (!passesFilters(t, filters)) {
+      retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now() });
       await env.BUFF_KV.put(`seen:${id}`, "1", { expirationTtl: 14 * 86400 });
       filtered++;
       continue;
     }
     try {
       await deliverTweet(env, t);
+      retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now() });
+      const hit = watchHit(t, watches);
+      if (hit) {
+        await bridgeSend(env, { text: `Watch hit for "${hit.phrase}": see the post above from ${t.name} (@${t.handle}).` }, String(env.ADMIN_PHONE).replace(/\D/g, "")).catch(() => {});
+      }
       await env.BUFF_KV.put(`seen:${id}`, "1", { expirationTtl: 14 * 86400 }); // mark seen only AFTER successful send
       delivered++;
       await sleep(250);
@@ -334,6 +364,11 @@ async function poll(env) {
       }
       throw e;
     }
+  }
+  if (retained.length) {
+    const items = await getFeedItems(env);
+    items.push(...retained);
+    await env.BUFF_KV.put(FEED_ITEMS_KEY, JSON.stringify(items.slice(-FEED_ITEMS_MAX)));
   }
   return `delivered=${delivered} dropped=${dropped} skipped=${skipped} filtered=${filtered} deferred=${deferred}${paused ? " paused" : ""}${waDown ? " wa_down" : ""}`;
 }
@@ -350,6 +385,9 @@ add subscriber <phone> - add a friend to the feed
 remove subscriber <phone> - remove them
 subscribers - list them
 pause / start - stop/resume the whole feed
+watch <topic> - flag when tracked accounts post about it
+unwatch <topic> / watches - manage watches
+anything on <topic>? - search the last ~400 feed items; I repost the matches
 status - bot health
 help - this text`;
 const HELP_SUB = `Buff commands for you:
@@ -386,6 +424,8 @@ async function handleCommand(env, from, textRaw) {
   if (addM) {
     const h = addM[1];
     const filters = await getFilters(env);
+  const watches = await getWatches(env);
+  const retained = []; // pushed into feed_items at the end (one batched write)
     const wasMuted = filters.muted.map((x) => x.toLowerCase()).includes(h.toLowerCase());
     if (wasMuted) {
       filters.muted = filters.muted.filter((x) => x.toLowerCase() !== h.toLowerCase());
@@ -402,6 +442,8 @@ async function handleCommand(env, from, textRaw) {
   if (rmM) {
     const h = rmM[1];
     const filters = await getFilters(env);
+  const watches = await getWatches(env);
+  const retained = []; // pushed into feed_items at the end (one batched write)
     if (!filters.muted.map((x) => x.toLowerCase()).includes(h.toLowerCase())) {
       filters.muted.push(h);
       await env.BUFF_KV.put("filters_v1", JSON.stringify(filters));
@@ -413,6 +455,8 @@ async function handleCommand(env, from, textRaw) {
   const fM = text.match(/^filter\s+@?([A-Za-z0-9_*]{1,15}|all)\s+linksonly\s+(on|off)\s*$/i);
   if (fM) {
     const filters = await getFilters(env);
+  const watches = await getWatches(env);
+  const retained = []; // pushed into feed_items at the end (one batched write)
     const k = fM[1].toLowerCase() === "all" ? "*" : fM[1];
     const has = filters.linkOnly.map((x) => x.toLowerCase()).includes(k.toLowerCase());
     if (fM[2].toLowerCase() === "on" && !has) filters.linkOnly.push(k);
@@ -422,6 +466,8 @@ async function handleCommand(env, from, textRaw) {
   }
   if (m === "filters") {
     const filters = await getFilters(env);
+  const watches = await getWatches(env);
+  const retained = []; // pushed into feed_items at the end (one batched write)
     return reply(`Muted: ${filters.muted.length ? filters.muted.map((x) => "@" + x).join(", ") : "none"}\nLink-only drops: ${filters.linkOnly.length ? filters.linkOnly.map((x) => (x === "*" ? "ALL" : "@" + x)).join(", ") : "none"}`);
   }
   const subM = text.match(/^(add|remove) subscriber\s+\+?(\d{7,15})\s*$/i);
@@ -448,6 +494,59 @@ async function handleCommand(env, from, textRaw) {
     const waDown = !!(await env.BUFF_KV.get("wa_down"));
     return reply(`Feed: ${pausedF ? "PAUSED" : "running"}${waDown ? " (bridge down - holding)" : ""}\nLast poll: ${lastPoll || "never"}\nLast error: ${lastError || "none"}`);
   }
+  const watchAddM = text.match(/^watch\s+(.{2,60})$/i);
+  if (watchAddM && !/^remove\b/i.test(watchAddM[1])) {
+    const watches = await getWatches(env);
+    const phrase = watchAddM[1].trim().toLowerCase();
+    if (watches.some((x) => x.phrase === phrase)) return reply(`Already watching "${phrase}".`);
+    watches.push({ phrase, at: Date.now() });
+    await env.BUFF_KV.put("watches", JSON.stringify(watches));
+    return reply(`Watching "${phrase}" - I'll flag it whenever a tracked account posts about it.`);
+  }
+  const watchRmM = text.match(/^(?:unwatch|watch remove|remove watch)\s+(.{2,60})$/i);
+  if (watchRmM) {
+    const watches = await getWatches(env);
+    const phrase = watchRmM[1].trim().toLowerCase();
+    const next = watches.filter((x) => x.phrase !== phrase);
+    await env.BUFF_KV.put("watches", JSON.stringify(next));
+    return reply(next.length === watches.length ? `No watch on "${phrase}".` : `Watch removed: "${phrase}".`);
+  }
+  if (m === "watches") {
+    const watches = await getWatches(env);
+    return reply(watches.length ? "Active watches:\n" + watches.map((x) => `- "${x.phrase}"`).join("\n") : "No watches set. Text: watch <topic> - to add one.");
+  }
+
+  // QUERY: anything else that looks like a question searches the retained feed items
+  if (/\?\s*$/.test(text) || /^(anything|heard|news|update|updates|what('s| is| has)?)\b/i.test(m)) {
+    const items = await getFeedItems(env);
+    const terms = queryTerms(text);
+    if (!items.length) return reply("No feed items stored yet - I start collecting once the feed runs.");
+    if (!terms.length) return reply("Ask me with a topic, e.g.: anything on the mayoral race?");
+    const scored = [];
+    items.forEach((it, idx) => {
+      const body = itemText(it);
+      let score = 0;
+      for (const term of terms) if (body.includes(term)) score++;
+      if (score) scored.push({ it, score, idx });
+    });
+    scored.sort((a, b) => b.score - a.score || b.idx - a.idx);
+    const top = scored.slice(0, 4);
+    if (!top.length) return reply(`Nothing in the last ${items.length} feed items about that.`);
+    const byAccount = {};
+    for (const { it } of scored) byAccount[it.handle] = (byAccount[it.handle] || 0) + 1;
+    const who = Object.entries(byAccount).map(([h, n]) => `@${h} x${n}`).join(", ");
+    await reply(`Found ${scored.length} match${scored.length === 1 ? "" : "es"} in the feed - who said what: ${who}. Reposting the most relevant:`);
+    for (const { it } of top) {
+      for (const media of it.media || []) {
+        await bridgeSend(env, media.kind === "image" ? { imageUrl: media.url } : { videoUrl: media.url }, from).catch(() => {});
+        await sleep(250);
+      }
+      await bridgeSend(env, { text: formatBody(it) }, from).catch(() => {});
+      await sleep(250);
+    }
+    return;
+  }
+
   return reply(HELP_ADMIN);
 }
 
@@ -492,6 +591,8 @@ export default {
       const waDown = !!(await env.BUFF_KV.get("wa_down"));
       const subs = await getSubscribers(env);
       const filters = await getFilters(env);
+  const watches = await getWatches(env);
+  const retained = []; // pushed into feed_items at the end (one batched write)
       const pending = await getPendingAdds(env);
       return Response.json({ ok: true, lastPoll, lastError, paused: pausedF, waDown, subscribers: subs.length, filters, pendingAdds: pending });
     }
