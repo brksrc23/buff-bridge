@@ -24,6 +24,7 @@ const AUTH_DIR = process.env.AUTH_DIR || path.join(process.cwd(), 'auth');
 const PAIR_PHONE = (process.env.PAIR_PHONE || '').replace(/\D/g, '');
 const USE_PAIRING_CODE = process.env.USE_PAIRING_CODE === '1'; // default: QR flow
 const PAIR_KEY = process.env.PAIR_KEY || ''; // read-only key for the /pair page, /qr.png, /status - does NOT gate /send
+const WORKER_URL = process.env.WORKER_URL || ''; // buff-feed-bot worker base URL for incoming command forwarding
 
 if (!SECRET) { console.error('BRIDGE_SECRET env var is required'); process.exit(1); }
 
@@ -112,6 +113,25 @@ async function start() {
     markOnlineOnConnect: false
   });
 
+  sock.ev.on('messages.upsert', (m) => {
+    if (!WORKER_URL) return;
+    for (const msg of (m.messages || [])) {
+      try {
+        if (!msg.message || msg.key.fromMe) continue;
+        const from = (msg.key.remoteJid || '').replace(/@.*/, '');
+        if (!/^\d+$/.test(from)) continue; // ignore groups/status
+        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+        if (!text.trim()) continue;
+        fetch(WORKER_URL + '/incoming', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: SECRET },
+          body: JSON.stringify({ from, text: text.trim(), id: msg.key.id })
+        }).then((r) => { if (!r.ok) console.error('incoming fwd HTTP', r.status); })
+          .catch((e) => console.error('incoming fwd failed:', e.message));
+      } catch (e) { console.error('incoming fwd error:', e.message); }
+    }
+  });
+
   sock.ev.on('creds.update', () => {
     if (!state.creds.registered && state.creds.me && state.creds.me.id) {
       state.creds.registered = true; // normalize: pair succeeded, flag lost to the rc14 companion_reg bug
@@ -172,8 +192,8 @@ async function start() {
   });
 }
 
-async function sendToRecipient({ text, imageUrl, videoUrl, quoteId }) {
-  const jid = RECIPIENT + '@s.whatsapp.net';
+async function sendToRecipient({ text, imageUrl, videoUrl, quoteId, to }) {
+  const jid = ((to || RECIPIENT) + '').replace(/\D/g, '') + '@s.whatsapp.net';
   let content;
   if (imageUrl) content = { image: { url: imageUrl } };
   else if (videoUrl) content = { video: { url: videoUrl } };
