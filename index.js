@@ -5,6 +5,7 @@
 // POST /send with header "Authorization: <BRIDGE_SECRET>".
 
 import http from 'node:http';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import * as Baileys from '@whiskeysockets/baileys';
@@ -344,7 +345,7 @@ const server = http.createServer(async (req, res) => {
     let payload;
     try { payload = JSON.parse(body); } catch { return reply(400, { error: 'bad json' }); }
     // transport dedupe: collapse identical sends within 15 min (overlapping poll ticks, duplicate cron events)
-    const fp = require('crypto').createHash('sha1').update(String(payload.to || '') + '|' + (payload.text || '') + '|' + (payload.imageUrl || '') + '|' + (payload.videoUrl || '')).digest('hex');
+    const fp = createHash('sha1').update(String(payload.to || '') + '|' + (payload.text || '') + '|' + (payload.imageUrl || '') + '|' + (payload.videoUrl || '')).digest('hex');
     const now = Date.now();
     for (const [k, t] of recentSends) if (now - t > 15 * 60 * 1000) recentSends.delete(k);
     if (recentSends.has(fp)) return reply(200, { id: null, dupe: true });
