@@ -44,6 +44,7 @@ let lastQR = null;
 let lastQRAt = null;
 let connected = false;
 let ephemeralState = null; // last disappearing-messages set/readback on the feed chat
+const recentSends = new Map(); // transport dedupe window: payload fingerprint -> sent-at ms
 let registered = false;
 let lastPairingCode = null;
 let lastPairingAt = null;
@@ -342,11 +343,18 @@ const server = http.createServer(async (req, res) => {
     if (!connected || !sock) return reply(503, { error: 'whatsapp not connected' });
     let payload;
     try { payload = JSON.parse(body); } catch { return reply(400, { error: 'bad json' }); }
+    // transport dedupe: collapse identical sends within 15 min (overlapping poll ticks, duplicate cron events)
+    const fp = require('crypto').createHash('sha1').update(String(payload.to || '') + '|' + (payload.text || '') + '|' + (payload.imageUrl || '') + '|' + (payload.videoUrl || '')).digest('hex');
+    const now = Date.now();
+    for (const [k, t] of recentSends) if (now - t > 15 * 60 * 1000) recentSends.delete(k);
+    if (recentSends.has(fp)) return reply(200, { id: null, dupe: true });
+    recentSends.set(fp, now);
     try {
       const id = await sendToRecipient(payload);
       recordSend(payload);
       reply(200, { id });
     } catch (e) {
+      recentSends.delete(fp); // send failed: allow a genuine retry
       reply(502, { error: String((e && e.message) || e) });
     }
   });
