@@ -779,6 +779,8 @@ const DEFAULT_RULES = [
   "Deliver breaking news AND major developments: statements and press conferences from heads of state/government (including the US President and Israeli PM), major policy moves, war/security events, disasters, major market/economic news, and significant updates to ongoing stories.",
   "Drop commentary, opinion, reaction clips, promos, and routine politics chatter.",
   "Weather: deliver only urgent life/property-threatening WARNINGS for populated areas (tornado warning, severe thunderstorm warning, flash flood warning, hurricane warning). Drop watches, outlooks, mesoscale discussions, and routine forecasts.",
+  "Local crime/police incidents: drop routine ones entirely. Keep only mass-casualty events, terror, active manhunts, or attacks with national significance.",
+  "War coverage: deliver the first break of a new front or operation and major escalations only. Do NOT deliver each individual strike, raid, or skirmish update.",
 ];
 const VALID_MODES = ["everything", "breaking", "custom"];
 const getMode = async (env) => { const m = await env.BUFF_KV.get("feed_mode"); return VALID_MODES.includes(m) ? m : "everything"; };
