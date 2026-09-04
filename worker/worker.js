@@ -280,11 +280,12 @@ async function sendShabbosDigest(env, opts) {
   if (!items.length) {
     text = "*Shabbos rundown*\nAll quiet - nothing passed the filter in the last day.";
   } else {
-    const brief = items.slice(-120).map((t) => ({ account: "@" + t.handle, text: (t.text || t.origText || "").slice(0, 180) }));
+    const brief = items.slice(-200).map((t) => ({ account: "@" + t.handle, text: (t.text || t.origText || "").slice(0, 180) }));
     const prompt =
       "You are writing a Shabbos rundown: a full-spectrum recap of these news posts (about 25 hours) for one WhatsApp user who was offline. " +
       "Organize into topic SECTIONS with headers like *WORLD EVENTS*, *MIDDLE EAST*, *US POLITICS*, *WEATHER & DISASTERS*, *ECONOMY*, *OTHER* (use only sections that have content, most important first). " +
       "Within each section, merge updates about the same event into one entry and give the key developments as concise bullets. Cover the whole window, not just the biggest stories. " +
+      "Apply the feed's editorial standard: leave out routine commentary, tabloid, celebrity, sports, lifestyle, non-warning weather, and local-interest filler - include only what a breaking-news follower would care about. " +
       "Plain text, WhatsApp formatting (*bold* headers, - bullets), no links, no hashtags. Posts:\n" +
       JSON.stringify(brief);
     let sections;
@@ -609,7 +610,7 @@ async function poll(env, maxDeliver) {
         if (!passesFilters(t, filters)) continue;
         if ((await env.BUFF_KV.get(`gem:${id}`)) !== null) continue;
         candidates.push(t);
-        if (candidates.length >= 10) break;
+        if (candidates.length >= (shabbos ? 40 : 10)) break; // during hold there's no delivery race - classify deeper so bursts don't leak unfiltered into the digest buffer
       }
       if (candidates.length) {
         const verdicts = await geminiClassify(env, gemKey, rules, feedMode, candidates, await getAcctRules(env));
