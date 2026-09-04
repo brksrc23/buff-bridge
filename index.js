@@ -314,6 +314,24 @@ const server = http.createServer(async (req, res) => {
       return res.end(buf);
     } catch (e) { return reply(500, { error: String((e && e.message) || e) }); }
   }
+  if (req.method === 'POST' && reqUrl.pathname === '/delete') {
+    if (req.headers.authorization !== SECRET) return reply(401, { error: 'bad auth' });
+    let dbody = '';
+    req.on('data', (c) => { dbody += c; if (dbody.length > 1e5) req.destroy(); });
+    req.on('end', async () => {
+      if (!connected || !sock) return reply(503, { error: 'whatsapp not connected' });
+      let payload;
+      try { payload = JSON.parse(dbody); } catch { return reply(400, { error: 'bad json' }); }
+      const id = payload && payload.id;
+      if (!id) return reply(400, { error: 'needs id' });
+      const jid = ((payload.to || RECIPIENT) + '').replace(/\D/g, '') + '@s.whatsapp.net';
+      try {
+        await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: true, id: String(id) } });
+        reply(200, { ok: true });
+      } catch (e) { reply(502, { error: String((e && e.message) || e) }); }
+    });
+    return;
+  }
   if (req.method !== 'POST' || reqUrl.pathname !== '/send') return reply(404, { error: 'not found' });
   if (req.headers.authorization !== SECRET) return reply(401, { error: 'bad auth' });
 
