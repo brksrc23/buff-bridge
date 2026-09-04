@@ -174,14 +174,15 @@ async function start() {
       registered = true;
       console.log('WhatsApp connected as', sock.user && sock.user.id);
       flushNow(AUTH_DIR); // paired/session refresh - persist promptly
-      // 24h disappearing messages on the feed chat, set from the bot side (Ezra 2026-09-03). Re-asserted on every connect.
+      // Native ephemeral is OFF (2026-09-04): the chat-level flag only showed a confusing clock icon and never worked.
+      // Auto-clear is Plan B: the worker deletes the bot's own feed messages after 24h via /delete. Re-assert OFF on every connect.
       try {
         const feedJid = RECIPIENT + '@s.whatsapp.net';
-        await sock.sendMessage(feedJid, { disappearingMessagesInChat: 86400 });
+        await sock.sendMessage(feedJid, { disappearingMessagesInChat: false });
         const chk = await sock.fetchDisappearingDuration(feedJid).catch(() => null);
         const dur = chk && chk[0] && (chk[0].result?.duration ?? chk[0].duration);
-        ephemeralState = { set: 86400, readback: dur ?? null, at: new Date().toISOString() };
-        console.log('ephemeral 86400 set on feed chat, readback:', dur);
+        ephemeralState = { set: 0, readback: dur ?? null, at: new Date().toISOString() };
+        console.log('ephemeral disabled on feed chat, readback:', dur);
       } catch (e) {
         ephemeralState = { set: null, error: String(e.message || e), at: new Date().toISOString() };
         console.error('ephemeral set failed:', e.message);
