@@ -220,16 +220,51 @@ async function formatBody(t) {
 }
 
 // ---------- Shabbos hold (2026-09-04, Ezra) ----------
-// Bot keeps polling/filtering/deduping, but WhatsApp delivery holds Fri evening -> Sat night (America/New_York).
-// Held posts are retained with held:true; at window end ONE Gemini digest goes out, then live delivery resumes
-// (held posts are already marked seen, so no backlog dump). Err longer: Fri 7:10 PM -> Sat 8:40 PM ET.
-// KV overrides: shabbos_auto="0" disables entirely; shabbos_force="on"/"off" for testing.
+// Bot keeps polling/filtering/deduping, but WhatsApp delivery holds from candle-lighting Friday to tzeit
+// hakochavim (72 min, err-longest) Saturday night. Times come from Hebcal for the configured zip, refreshed
+// weekly and cached in KV shabbos_times. Held posts are retained with held:true; at window end ONE Gemini
+// digest goes out, then live delivery resumes (held posts are already marked seen, so no backlog dump).
+// KV overrides: shabbos_auto="0" disables entirely; shabbos_force="on"/"off" for testing;
+// shabbos_zip changes the zmanim location (default Pikesville MD - Ezra's home base, followed even when traveling).
+const SHABBOS_DEFAULT_ZIP = "21208";
+async function fetchShabbosWindow(zip) {
+  try {
+    const res = await fetch("https://www.hebcal.com/shabbat?cfg=json&m=72&zip=" + encodeURIComponent(zip), { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) return null;
+    const items = (await res.json()).items || [];
+    const candles = items.find((i) => i.category === "candles");
+    const havs = items.filter((i) => i.category === "havdalah");
+    const havdalah = havs[havs.length - 1]; // last havdalah covers multi-day yom tov spans
+    if (!candles || !havdalah) return null;
+    return { start: candles.date, end: havdalah.date, zip, fetchedAt: new Date().toISOString() };
+  } catch (e) { return null; }
+}
+async function getShabbosWindow(env) {
+  const zip = (await env.BUFF_KV.get("shabbos_zip")) || SHABBOS_DEFAULT_ZIP;
+  const cached = await getJSON(env, "shabbos_times", null);
+  const now = Date.now();
+  if (cached && cached.zip === zip && cached.end && Date.parse(cached.end) > now) return cached;
+  const fresh = await fetchShabbosWindow(zip);
+  if (fresh) {
+    try { await env.BUFF_KV.put("shabbos_times", JSON.stringify(fresh)); } catch (e) {}
+    return fresh;
+  }
+  return cached && cached.end && Date.parse(cached.end) > now ? cached : null;
+}
 async function shabbosHoldActive(env) {
   try {
     const force = await env.BUFF_KV.get("shabbos_force");
     if (force === "on") return true;
     if (force === "off") return false;
     if ((await env.BUFF_KV.get("shabbos_auto")) === "0") return false;
+    const win = await getShabbosWindow(env);
+    if (win) {
+      const now = Date.now();
+      if (now >= Date.parse(win.start) && now < Date.parse(win.end)) return true;
+    }
+  } catch (e) {}
+  // Fixed err-longer fallback, also UNIONED with the Hebcal window so a bad/missing fetch never shortens the hold
+  try {
     const et = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
     const day = et.getDay(), mins = et.getHours() * 60 + et.getMinutes();
     if (day === 5 && mins >= 19 * 60 + 10) return true;
@@ -617,7 +652,8 @@ async function poll(env, maxDeliver) {
       retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), held: true });
       try {
         const hfp = storyFp([t.text, t.origText, t.quotedText].filter(Boolean).join(" "));
-        if (isStoryDupeFp(hfp, stories)) { await env.BUFF_KV.put(`seen:${t.id}`, "1", { expirationTtl: 14 * 86400 }); storyDupes++; continue; }
+        const hasMedia = (t.media || []).length > 0; // new photos/videos/angles of an event are NOT dupes (2026-09-04 Ezra); identical media is already caught by media memory
+        if (!hasMedia && isStoryDupeFp(hfp, stories)) { await env.BUFF_KV.put(`seen:${t.id}`, "1", { expirationTtl: 14 * 86400 }); storyDupes++; continue; }
         if (hfp.u.size) stories.push({ u: [...hfp.u].slice(0, 60), e: [...hfp.e].slice(0, 40), at: Date.now() });
       } catch (e) {}
       await env.BUFF_KV.put(`seen:${t.id}`, "1", { expirationTtl: 14 * 86400 });
@@ -630,7 +666,8 @@ async function poll(env, maxDeliver) {
     let fp = null;
     try {
       fp = storyFp([t.text, t.origText, t.quotedText].filter(Boolean).join(" "));
-      if (isStoryDupeFp(fp, stories)) {
+      const hasMedia = (t.media || []).length > 0; // new photos/videos/angles of an event are NOT dupes (2026-09-04 Ezra)
+      if (!hasMedia && isStoryDupeFp(fp, stories)) {
           retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), storyDupe: true });
           await env.BUFF_KV.put(`seen:${t.id}`, "1", { expirationTtl: 14 * 86400 });
           storyDupes++;
@@ -878,6 +915,7 @@ async function handleIncoming(request, env) {
 const GEMINI_MODEL = "gemini-3.1-flash-lite";
 const DEFAULT_RULES = [
   "Deliver breaking news AND major developments: statements and press conferences from heads of state/government (including the US President and Israeli PM), major policy moves, war/security events, disasters, major market/economic news, and significant updates to ongoing stories.",
+  "Major newsworthy events and public gatherings (e.g. prominent delegations meeting officials, major political/community events): deliver substantive coverage from all angles - statements, photos, videos - not just the first break.",
   "Drop commentary, opinion, reaction clips, promos, and routine politics chatter.",
   "Weather: deliver only urgent life/property-threatening WARNINGS for populated areas (tornado warning, severe thunderstorm warning, flash flood warning, hurricane warning). Drop watches, outlooks, mesoscale discussions, and routine forecasts.",
   "Local crime/police incidents: drop routine ones entirely. Keep only mass-casualty events, terror, active manhunts, or attacks with national significance.",
