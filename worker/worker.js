@@ -249,12 +249,87 @@ async function deliverToAll(env, payload) {
   let firstId = null;
   for (const to of targets) {
     const id = await bridgeSend(env, payload, to);
+    if (id) {
+      // Plan B auto-clear: log every feed message so the poll loop can delete it for everyone after 24h
+      try { await env.BUFF_KV.put(`sent:${to}:${id}`, String(Date.now()), { expirationTtl: 26 * 3600 }); } catch (e) {}
+    }
     if (!firstId) firstId = id;
     await sleep(250);
   }
   return firstId;
 }
 
+
+// ---------- Plan B: 24h auto-clear of the bot's own feed messages ----------
+async function bridgeDelete(env, id, to) {
+  const res = await fetch(`${env.BRIDGE_URL}/delete`, {
+    method: "POST",
+    headers: { authorization: env.BRIDGE_SECRET, "content-type": "application/json" },
+    body: JSON.stringify({ id, to }),
+    signal: AbortSignal.timeout(15000)
+  });
+  return res.ok;
+}
+
+async function purgeOldSent(env) {
+  // Deletes the bot's own feed messages older than 24h (delete-for-everyone). Fail-open: never breaks the poll.
+  try {
+    const cutoff = Date.now() - 24 * 3600 * 1000;
+    const list = await env.BUFF_KV.list({ prefix: "sent:" });
+    let purged = 0;
+    for (const k of list.keys) {
+      const at = Number(await env.BUFF_KV.get(k.name));
+      if (!at || at > cutoff) continue;
+      const [, to, id] = k.name.split(":");
+      const ok = await bridgeDelete(env, id, to).catch(() => false);
+      if (ok) { await env.BUFF_KV.delete(k.name); purged++; }
+      await sleep(200);
+    }
+    return purged;
+  } catch (e) { return 0; }
+}
+
+// ---------- story-level dedup ----------
+// Same story from multiple accounts = deliver once (first wins), later accounts suppressed.
+// Fingerprint: normalized content tokens (URLs/mentions/stopwords stripped, diacritics folded, any script).
+// Jaccard vs stories delivered in the last 24h; threshold 0.5. Fail-open: any doubt or error -> deliver.
+const STORIES_KEY = "stories_v1";
+const STOPWORDS = new Set(("a an the and or but if then else of at by for with about into over after before to from in on as is are was were be been it its this that these those he she they we you his her their our your not no yes says said say just now new breaking update watch video photos photo live rt via more will would can could has have had do does did who what when where why how all any both each few most other some such than too very own same so up out off again once here there also only first last amid against between during under trump president").split(" "));
+// Fingerprint: content unigrams + entity candidates (capitalized tokens in cased scripts; every content token in
+// non-cased scripts like Arabic/Hebrew). Dupe = entity containment >= 0.65 AND unigram containment >= 0.45
+// (no entities -> unigram-only at 0.6). Containment (intersection over the smaller set) tolerates short vs long
+// versions of the same headline; prefix-match (len>=5) folds inflections like canada/canadian.
+function storyFp(text) {
+  const raw = (text || "").replace(/https?:\/\/\S+/g, " ").replace(/@\w+/g, " ").replace(/^RT\s+/i, " ");
+  const words = raw.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  const u = new Set(), e = new Set();
+  for (const w of words) {
+    const lw = w.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+    if (lw.length <= 2 || STOPWORDS.has(lw)) continue;
+    u.add(lw);
+    const latin = /^[A-Za-z\u00c0-\u024f]/.test(w);
+    if (!latin || /^\p{Lu}/u.test(w)) e.add(lw);
+  }
+  return { u, e };
+}
+function tokEq(a, b) { return a === b || (a.length >= 5 && b.length >= 5 && (a.startsWith(b) || b.startsWith(a))); }
+function contSim(a, b) {
+  if (!a.size || !b.size) return 0;
+  const small = a.size <= b.size ? a : b, large = a.size <= b.size ? b : a;
+  let inter = 0;
+  for (const w of small) { for (const v of large) { if (tokEq(w, v)) { inter++; break; } } }
+  return inter / small.size;
+}
+function isStoryDupeFp(fp, stories) {
+  if (fp.u.size < 4) return false; // too little signal -> deliver
+  for (const s of stories) {
+    const eu = new Set(s.e || []);
+    const uni = contSim(fp.u, new Set(s.u || []));
+    const ent = eu.size && fp.e.size ? contSim(fp.e, eu) : null;
+    if (ent !== null ? (ent >= 0.65 && uni >= 0.45) : uni >= 0.6) return true;
+  }
+  return false;
+}
 
 // ---------- media dedup ----------
 // Fingerprint media worker-side (Cloudflare egress is free; bridge->WhatsApp upload is the metered part).
@@ -387,6 +462,8 @@ async function poll(env, maxDeliver) {
   const filters = await getFilters(env);
   const watches = await getWatches(env);
   const retained = []; // pushed into feed_items at the end (one batched write)
+  const stories = (await getJSON(env, STORIES_KEY, [])).filter((s) => Date.now() - s.at < 24 * 3600 * 1000); // delivered-story fingerprints, 24h window; tick-local appends make same-tick dupes deterministic
+  let storyDupes = 0;
 
   // pending adds: confirm once a staged account actually shows up in the list timeline
   const pendingAdds = await getPendingAdds(env);
@@ -420,7 +497,7 @@ async function poll(env, maxDeliver) {
       }
       if (candidates.length) {
         const verdicts = await geminiClassify(env, gemKey, rules, feedMode, candidates, await getAcctRules(env));
-        for (const [vid, ok] of verdicts) await env.BUFF_KV.put(`gem:${vid}`, ok ? "1" : "0", { expirationTtl: 14 * 86400 });
+        for (const [vid, gv] of verdicts) await env.BUFF_KV.put(`gem:${vid}`, JSON.stringify(gv), { expirationTtl: 14 * 86400 });
       }
     }
   }
@@ -440,8 +517,8 @@ async function poll(env, maxDeliver) {
       continue;
     }
     if (!holding && feedMode !== "everything") {
-      const verdict = await env.BUFF_KV.get(`gem:${id}`);
-      if (verdict === "0") { // gatekeeper dropped it: retain for queries, never deliver
+      const gv = parseGem(await env.BUFF_KV.get(`gem:${id}`));
+      if (gv && gv.d === false) { // gatekeeper dropped it: retain for queries, never deliver
         retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now() });
         await env.BUFF_KV.put(`seen:${id}`, "1", { expirationTtl: 14 * 86400 });
         filtered++;
@@ -455,8 +532,20 @@ async function poll(env, maxDeliver) {
       continue;
     }
     if (maxDeliver && delivered >= maxDeliver) break; // leave the rest unseen for the next tick
+    // story-level dedup: same story already delivered from another account -> suppress (fail-open on any error)
+    let fp = null;
+    try {
+      fp = storyFp([t.text, t.origText, t.quotedText].filter(Boolean).join(" "));
+      if (isStoryDupeFp(fp, stories)) {
+          retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), storyDupe: true });
+          await env.BUFF_KV.put(`seen:${t.id}`, "1", { expirationTtl: 14 * 86400 });
+          storyDupes++;
+          continue;
+      }
+    } catch (e) { fp = null; }
     try {
       suppressed += await deliverTweet(env, t);
+      if (fp && fp.u.size) stories.push({ u: [...fp.u].slice(0, 60), e: [...fp.e].slice(0, 40), at: Date.now() });
       retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now() });
       const hit = watchHit(t, watches);
       if (hit) {
@@ -475,6 +564,7 @@ async function poll(env, maxDeliver) {
       throw e;
     }
   }
+  try { await env.BUFF_KV.put(STORIES_KEY, JSON.stringify(stories.slice(-120))); } catch (e) {}
   if (retained.length) {
     const items = await getFeedItems(env);
     items.push(...retained);
@@ -486,7 +576,7 @@ async function poll(env, maxDeliver) {
     vol.delivered += delivered; vol.suppressed += suppressed; vol.filtered += filtered; vol.deferred += deferred;
     await env.BUFF_KV.put(vkey, JSON.stringify(vol), { expirationTtl: 7 * 86400 });
   }
-  return `delivered=${delivered} dropped=${dropped} skipped=${skipped} filtered=${filtered} deferred=${deferred} suppressed=${suppressed}${paused ? " paused" : ""}${waDown ? " wa_down" : ""}`;
+  return `delivered=${delivered} dropped=${dropped} skipped=${skipped} filtered=${filtered} deferred=${deferred} suppressed=${suppressed}${storyDupes ? ` storydupes=${storyDupes}` : ""}${paused ? " paused" : ""}${waDown ? " wa_down" : ""}`;
 }
 
 // ---------- commands ----------
@@ -686,10 +776,9 @@ async function handleIncoming(request, env) {
 // ---------- Gemini gatekeeper + feed modes ----------
 const GEMINI_MODEL = "gemini-3.1-flash-lite";
 const DEFAULT_RULES = [
-  "Always deliver breaking news and on-the-ground event footage.",
-  "Deliver major new developments and significant updates to ongoing stories, not only first-break reports.",
-  "Drop link-only posts that just push an article with no news substance in the text.",
-  "Drop routine commentary, opinion chatter, self-promotion, and noise.",
+  "Deliver breaking news AND major developments: statements and press conferences from heads of state/government (including the US President and Israeli PM), major policy moves, war/security events, disasters, major market/economic news, and significant updates to ongoing stories.",
+  "Drop commentary, opinion, reaction clips, promos, and routine politics chatter.",
+  "Weather: deliver only urgent life/property-threatening WARNINGS for populated areas (tornado warning, severe thunderstorm warning, flash flood warning, hurricane warning). Drop watches, outlooks, mesoscale discussions, and routine forecasts.",
 ];
 const VALID_MODES = ["everything", "breaking", "custom"];
 const getMode = async (env) => { const m = await env.BUFF_KV.get("feed_mode"); return VALID_MODES.includes(m) ? m : "everything"; };
@@ -698,8 +787,16 @@ const getAcctRules = (env) => getJSON(env, "acct_rules", {}); // {handleLower: "
 const getGeminiKey = async (env) => env.GEMINI_API_KEY || (await env.BUFF_KV.get("gemini_key")) || null;
 
 // Classify a batch of candidate posts. FAIL-OPEN: any error, timeout, or malformed answer -> deliver everything.
+// gem:<id> values: legacy "1"/"0" bits or {"d":bool,"r":"one-line reason"}. parseGem normalizes.
+function parseGem(v) {
+  if (v == null) return null;
+  if (v === "1") return { d: true };
+  if (v === "0") return { d: false };
+  try { const j = JSON.parse(v); return j && typeof j.d === "boolean" ? j : null; } catch (e) { return null; }
+}
+
 async function geminiClassify(env, key, rules, mode, tweets, acctRules) {
-  const verdicts = new Map(tweets.map((t) => [t.id, true]));
+  const verdicts = new Map(tweets.map((t) => [t.id, { d: true }]));
   try {
     const ar = acctRules || {};
     const brief = tweets.map((t) => ({
@@ -717,7 +814,7 @@ async function geminiClassify(env, key, rules, mode, tweets, acctRules) {
       "Standing rules:\n- " + rules.join("\n- ") + "\nWhen a post has accountRule, apply it to that post in addition to the standing rules.\n" +
       (mode === "breaking" ? "MODE: BREAKING NEWS ONLY. Deliver only urgent breaking news and on-the-ground event footage; drop everything else, even posts a looser filter would keep.\n" : "MODE: CUSTOM. Judge every post against the standing rules.\n") +
       "Posts:\n" + JSON.stringify(brief) + "\n" +
-      "Reply with ONLY a JSON array like [{\"id\":\"...\",\"deliver\":true}] covering every post id. No prose.";
+      "Reply with ONLY a JSON array like [{\"id\":\"...\",\"deliver\":true,\"reason\":\"one short line\"}] covering every post id. Reason: max 12 words, plain. No other prose.";
     const res = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
       method: "POST",
       headers: { "content-type": "application/json", "x-goog-api-key": key },
@@ -725,7 +822,7 @@ async function geminiClassify(env, key, rules, mode, tweets, acctRules) {
         model: GEMINI_MODEL,
         input: prompt,
         store: false,
-        generation_config: { temperature: 0, max_output_tokens: 800, thinking_level: "minimal" },
+        generation_config: { temperature: 0, max_output_tokens: 1400, thinking_level: "minimal" },
       }),
       signal: AbortSignal.timeout(20000),
     });
@@ -735,7 +832,7 @@ async function geminiClassify(env, key, rules, mode, tweets, acctRules) {
     const start = txt.indexOf("["), end = txt.lastIndexOf("]");
     if (start < 0 || end <= start) return verdicts; // fail open
     const arr = JSON.parse(txt.slice(start, end + 1));
-    for (const v of arr) if (v && v.id && typeof v.deliver === "boolean") verdicts.set(String(v.id), v.deliver);
+    for (const v of arr) if (v && v.id && typeof v.deliver === "boolean") verdicts.set(String(v.id), { d: v.deliver, r: typeof v.reason === "string" ? v.reason.slice(0, 140) : undefined });
     const day = new Date().toISOString().slice(0, 10);
     const ukey = `gem_usage:${day}`;
     const used = parseInt((await env.BUFF_KV.get(ukey)) || "0", 10) + 1;
@@ -1050,7 +1147,7 @@ async function handleAdminApi(request, env, url) {
       if (!probe.ok) probeErr = "HTTP " + probe.status;
     } catch (e) { probeErr = String(e.message || e); }
     const verdicts = await geminiClassify(env, key, rules, mode, items, acctRules);
-    const out = items.map((t) => ({ id: t.id, account: "@" + t.handle, deliver: verdicts.get(t.id) !== false, text: (t.text || t.origText || "").slice(0, 80) }));
+    const out = items.map((t) => { const gv = verdicts.get(t.id) || {}; return { id: t.id, account: "@" + t.handle, deliver: gv.d !== false, reason: gv.r, text: (t.text || t.origText || "").slice(0, 80) }; });
     return Response.json({ ok: true, geminiReachable: reachable, probeError: probeErr, mode, tested: out.length, deliver: out.filter((v) => v.deliver).length, drop: out.filter((v) => !v.deliver).length, verdicts: out });
   }
   if (path === "/admin/api/admin-key") {
@@ -1139,8 +1236,9 @@ export default {
         try { await fetch(env.BRIDGE_URL + "/status", { headers: { authorization: env.BRIDGE_SECRET }, signal: AbortSignal.timeout(10000) }); } catch (e) {}
         try { await env.BUFF_KV.put("last_poll", `${new Date().toISOString()} tick`); } catch (e) {}
         try {
+          const purged = await purgeOldSent(env); // Plan B auto-clear: delete the bot's own feed messages older than 24h
           const result = await poll(env, 6); // cap per-tick deliveries so the run stays inside the cron time budget; remainder flows next minute
-          await env.BUFF_KV.put("last_poll", `${new Date().toISOString()} ${result} (${Date.now() - t0}ms)`);
+          await env.BUFF_KV.put("last_poll", `${new Date().toISOString()} ${result}${purged ? ` purged=${purged}` : ""} (${Date.now() - t0}ms)`);
         } catch (e) {
           try {
             const msg = `${new Date().toISOString()} ${e.message}`;
