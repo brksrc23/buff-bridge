@@ -769,8 +769,113 @@ async function renderPower(env, action) { // "suspend" | "resume"
 // ---------- admin dashboard ----------
 const ADMIN_HTML = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>BUFF Admin</title>\n<style>\n  :root { --bg:#0f1115; --card:#181c24; --line:#262c38; --txt:#e8eaf0; --dim:#8b93a5; --accent:#4da3ff; --green:#3ddc84; --red:#ff5c5c; }\n  * { box-sizing:border-box; }\n  body { margin:0; background:var(--bg); color:var(--txt); font:15px/1.45 -apple-system, system-ui, sans-serif; }\n  .wrap { max-width:860px; margin:0 auto; padding:16px; }\n  h1 { font-size:20px; margin:8px 0 2px; }\n  .sub { color:var(--dim); font-size:13px; margin-bottom:16px; }\n  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin-bottom:14px; }\n  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 10px; }\n  .row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }\n  .modes button, .pill { border:1px solid var(--line); background:#10141b; color:var(--txt); border-radius:999px; padding:8px 14px; cursor:pointer; font-size:14px; }\n  .modes button.active { background:var(--accent); border-color:var(--accent); color:#04101f; font-weight:600; }\n  .toggle { width:46px; height:26px; border-radius:999px; background:#2a3140; border:1px solid var(--line); position:relative; cursor:pointer; flex:none; }\n  .toggle::after { content:\"\"; position:absolute; top:2px; left:2px; width:20px; height:20px; border-radius:50%; background:#fff; transition:left .15s; }\n  .toggle.on { background:var(--green); }\n  .toggle.on::after { left:22px; }\n  table { width:100%; border-collapse:collapse; }\n  td, th { text-align:left; padding:7px 6px; border-bottom:1px solid var(--line); font-size:14px; }\n  th { color:var(--dim); font-size:12px; font-weight:600; }\n  .muted-h { color:var(--dim); }\n  input[type=text], input[type=password], textarea { width:100%; background:#10141b; border:1px solid var(--line); color:var(--txt); border-radius:8px; padding:9px 10px; font-size:14px; }\n  textarea { min-height:110px; font-family:inherit; }\n  .btn { background:var(--accent); color:#04101f; border:0; border-radius:8px; padding:9px 14px; font-weight:600; cursor:pointer; }\n  .btn.ghost { background:#10141b; color:var(--txt); border:1px solid var(--line); }\n  .btn.danger { background:transparent; color:var(--red); border:1px solid var(--red); padding:4px 10px; font-size:13px; }\n  .chip { display:inline-flex; align-items:center; gap:8px; background:#10141b; border:1px solid var(--line); border-radius:999px; padding:6px 12px; margin:3px 4px 3px 0; font-size:14px; }\n  .chip button { background:none; border:0; color:var(--red); cursor:pointer; font-size:15px; padding:0; }\n  .stat { display:flex; justify-content:space-between; padding:5px 0; font-size:14px; }\n  .stat span:last-child { color:var(--dim); }\n  .ok { color:var(--green); } .bad { color:var(--red); }\n  #login { max-width:380px; margin:18vh auto 0; }\n  .hint { color:var(--dim); font-size:12px; margin-top:6px; }\n  .hidden { display:none; }\n</style>\n</head>\n<body>\n<div id=\"login\" class=\"card\">\n  <h1>BUFF Admin</h1>\n  <p class=\"sub\">Enter the admin key to manage the feed.</p>\n  <input type=\"password\" id=\"key\" placeholder=\"Admin key\" autocomplete=\"off\">\n  <div style=\"height:10px\"></div>\n  <button class=\"btn\" onclick=\"saveKey()\">Open dashboard</button>\n  <div class=\"hint\" id=\"loginErr\"></div>\n</div>\n<div class=\"wrap hidden\" id=\"app\">\n  <h1>BUFF Admin</h1>\n  <div class=\"sub\">X feed to WhatsApp - live control</div>\n\n  <div class=\"card\">\n    <h2>Feed</h2>\n    <div class=\"row\">\n      <div class=\"toggle\" id=\"pauseToggle\" onclick=\"setPaused()\"></div>\n      <div id=\"pauseLabel\">...</div>\n    </div>\n    <div class=\"hint\">Paused = nothing sends, feed keeps collecting. Start = resume from now. Never a backlog dump.</div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Bot power</h2>\n    <div class=\"row\">\n      <button class=\"btn\" id=\"powerBtn\" onclick=\"setPower()\">...</button>\n      <span class=\"hint\" id=\"powerHint\"></span>\n    </div>\n    <div class=\"hint\">OFF = stops polling and suspends the WhatsApp link (full Shabbos mode). ON = resumes. No catch-up either way - it continues from the moment you switch.</div>\n  </div>\n\n  <div class=\"card modes\">\n    <h2>Mode</h2>\n    <div class=\"row\">\n      <button data-mode=\"everything\" onclick=\"setMode('everything')\">Everything</button>\n      <button data-mode=\"breaking\" onclick=\"setMode('breaking')\">Breaking news only</button>\n      <button data-mode=\"custom\" onclick=\"setMode('custom')\">Custom (rules)</button>\n    </div>\n    <div class=\"hint\" id=\"modeHint\"></div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Content filters</h2>\n    <table><tbody>\n      <tr><td>Drop bare article-link posts (all accounts)</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgLinks\" onclick=\"setDrop('links')\"></div></td></tr>\n      <tr><td>Drop posts with videos</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgVideo\" onclick=\"setDrop('video')\"></div></td></tr>\n      <tr><td>Drop posts with images</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgImage\" onclick=\"setDrop('image')\"></div></td></tr>\n      <tr><td>Drop posts with GIFs</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgGif\" onclick=\"setDrop('gif')\"></div></td></tr>\n      <tr><td>Media memory (skip media already sent)</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgDedup\" onclick=\"setDedup()\"></div></td></tr>\n    </tbody></table>\n    <div class=\"hint\">Logo/boilerplate media is handled by media memory - it stays on unless you switch it off here.</div>\n  </div>\n  <div class=\"hint\" style=\"margin:-4px 0 14px\">Account list is managed on X itself. To mute an account or drop its link-only posts without removing it, text the bot: <b>mute @handle</b>, <b>linkonly @handle</b>.</div>\n\n  <div class=\"card\">\n    <h2>Gatekeeper rules (Gemini)</h2>\n    <div class=\"hint\">One rule per line, plain English. Used in Breaking and Custom modes. Default: deliver breaking news AND major updates to ongoing stories; drop routine commentary, opinion, and link-only posts. If Gemini is unreachable, posts deliver anyway (fail open).</div>\n    <div style=\"height:8px\"></div>\n    <textarea id=\"rules\"></textarea>\n    <div style=\"height:8px\"></div>\n    <div class=\"row\">\n      <button class=\"btn\" onclick=\"saveRules()\">Save rules</button>\n      <input type=\"password\" id=\"gemKey\" placeholder=\"Gemini API key - one-time install, stored as a Cloudflare secret\" style=\"flex:1\">\n      <button class=\"btn ghost\" onclick=\"saveGemKey()\">Install key</button>\n    </div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Status</h2>\n    <div class=\"stat\"><span>Last poll</span><span id=\"sLastPoll\">-</span></div>\n    <div class=\"stat\"><span>Last error</span><span id=\"sLastError\">-</span></div>\n    <div class=\"stat\"><span>WhatsApp link</span><span id=\"sWa\">-</span></div>\n    <div class=\"stat\"><span>Gemini gatekeeper</span><span id=\"sGem\">-</span></div>\n    <div class=\"stat\"><span>Pending account adds</span><span id=\"sPend\">-</span></div>\n    <div class=\"stat\"><span>Today: delivered / dupes skipped / filtered out</span><span id=\"sVol\">-</span></div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Watches</h2>\n    <div class=\"row\" style=\"margin-bottom:8px\">\n      <input type=\"text\" id=\"watchPhrase\" placeholder=\"Alert me when a post mentions...\" style=\"flex:1\">\n      <button class=\"btn\" onclick=\"addWatch()\">Watch</button>\n    </div>\n    <div id=\"watchList\"></div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Subscribers</h2>\n    <div class=\"row\" style=\"margin-bottom:8px\">\n      <input type=\"text\" id=\"subPhone\" placeholder=\"Phone, e.g. 1443...\" style=\"flex:1\">\n      <button class=\"btn\" onclick=\"addSub()\">Add</button>\n    </div>\n    <table><tbody id=\"subRows\"></tbody></table>\n  </div>\n\n  <div class=\"card\">\n    <h2>Access</h2>\n    <div class=\"hint\">Change the dashboard key. Anyone with the key can control the feed - keep it private.</div>\n    <div style=\"height:8px\"></div>\n    <input type=\"password\" id=\"curKey\" placeholder=\"Current key\">\n    <div style=\"height:8px\"></div>\n    <input type=\"password\" id=\"newKey\" placeholder=\"New key (8+ characters)\">\n    <div style=\"height:8px\"></div>\n    <button class=\"btn\" onclick=\"changeKey()\">Change key</button>\n    <span class=\"hint\" id=\"keyMsg\"></span>\n  </div>\n</div>\n<script>\nlet KEY = localStorage.getItem('buff_admin_key') || '';\nasync function api(path, body) {\n  const res = await fetch('/admin/api' + path, {\n    method: body ? 'POST' : 'GET',\n    headers: { 'content-type': 'application/json', 'x-admin-key': KEY },\n    body: body ? JSON.stringify(body) : undefined\n  });\n  if (res.status === 401) { showLogin('Wrong key.'); throw new Error('401'); }\n  return res.json();\n}\nfunction showLogin(err) {\n  document.getElementById('login').classList.remove('hidden');\n  document.getElementById('app').classList.add('hidden');\n  document.getElementById('loginErr').textContent = err || '';\n}\nfunction saveKey() {\n  KEY = document.getElementById('key').value.trim();\n  localStorage.setItem('buff_admin_key', KEY);\n  load();\n}\nfunction esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }\nasync function load() {\n  let s;\n  try { s = await api('/state'); } catch (e) { return; }\n  document.getElementById('login').classList.add('hidden');\n  document.getElementById('app').classList.remove('hidden');\n  const pt = document.getElementById('pauseToggle');\n  pt.classList.toggle('on', !s.paused);\n  document.getElementById('pauseLabel').innerHTML = s.paused ? '<b class=\"bad\">PAUSED</b> - tap to resume' : '<b class=\"ok\">RUNNING</b> - tap to pause';\n  document.querySelectorAll('.modes button').forEach(b => b.classList.toggle('active', b.dataset.mode === s.mode));\n  document.getElementById('modeHint').textContent =\n    s.mode === 'everything' ? 'Everything delivers (muted/link-only filters still apply). Gemini is bypassed.' :\n    s.mode === 'breaking' ? 'Gemini passes only breaking news and event footage, plus your always-deliver rules.' :\n    'Gemini judges every post against your rules below.';\n  const pb = document.getElementById('powerBtn');\n  pb.textContent = s.power === 'off' ? 'Turn bot ON' : 'Turn bot OFF';\n  pb.style.background = s.power === 'off' ? 'var(--green)' : 'var(--red)';\n  pb.style.color = s.power === 'off' ? '#04101f' : '#fff';\n  document.getElementById('powerHint').textContent = s.power === 'off' ? 'Bot is fully OFF.' : 'Bot is on.' + (s.powerConfigured ? '' : ' (power control not wired yet)');\n  document.getElementById('sLastPoll').textContent = s.lastPoll || 'never';\n  document.getElementById('sLastError').textContent = s.lastError || 'none';\n  document.getElementById('sWa').innerHTML = s.waDown ? '<b class=\"bad\">down</b>' : '<b class=\"ok\">connected</b>';\n  document.getElementById('sGem').textContent = s.gemini + (s.geminiUsage != null ? ' (' + s.geminiUsage + ' calls today)' : '');\n  document.getElementById('sPend').textContent = s.pendingAdds.length ? s.pendingAdds.map(p => '@' + p.handle).join(', ') : 'none';\n  document.getElementById('rules').value = (s.rules || []).join('\\n');\n  const d = s.drop || {};\n  document.getElementById('tgLinks').classList.toggle('on', !!(d.links || s.linkOnlyAll));\n  document.getElementById('tgVideo').classList.toggle('on', !!d.video);\n  document.getElementById('tgImage').classList.toggle('on', !!d.image);\n  document.getElementById('tgGif').classList.toggle('on', !!d.gif);\n  document.getElementById('tgDedup').classList.toggle('on', !s.dedupOff);\n  const v = s.volume || {};\n  document.getElementById('sVol').textContent = (v.delivered||0) + ' / ' + (v.suppressed||0) + ' / ' + (v.filtered||0);\n  if (s.pendingRemovals && s.pendingRemovals.length) document.getElementById('sPend').textContent += ' | queued X-removals: ' + s.pendingRemovals.map(p => '@' + p.handle).join(', ');\n  document.getElementById('watchList').innerHTML = (s.watches || []).map(w =>\n    '<span class=\"chip\">' + esc(w.phrase) + ' <button onclick=\"delWatch(\\'' + esc(w.phrase) + '\\')\">&times;</button></span>').join('') || '<span class=\"hint\">None.</span>';\n  document.getElementById('subRows').innerHTML = (s.subscribers || []).map(p =>\n    '<tr><td>' + esc(p.phone) + (p.paused ? ' <span class=\"muted-h\">(paused)</span>' : '') + '</td>' +\n    '<td style=\"text-align:right\"><button class=\"btn danger\" onclick=\"delSub(\\'' + esc(p.phone) + '\\')\">Remove</button></td></tr>').join('') || '<tr><td class=\"muted-h\">None.</td></tr>';\n}\nasync function setPaused() { const s = await api('/state'); await api('/pause', { paused: !s.paused }); load(); }\nasync function setMode(m) { await api('/mode', { mode: m }); load(); }\nasync function saveRules() { await api('/rules', { rules: document.getElementById('rules').value.split('\\n').map(x => x.trim()).filter(Boolean) }); load(); }\nasync function saveGemKey() { const k = document.getElementById('gemKey').value.trim(); if (!k) return; await api('/gemini-key', { key: k }); document.getElementById('gemKey').value = ''; load(); }\nasync function addWatch() { const p = document.getElementById('watchPhrase').value.trim(); if (!p) return; await api('/watch-add', { phrase: p }); document.getElementById('watchPhrase').value = ''; load(); }\nasync function delWatch(p) { await api('/watch-del', { phrase: p }); load(); }\nasync function addSub() { const p = document.getElementById('subPhone').value.trim(); if (!p) return; await api('/sub-add', { phone: p }); document.getElementById('subPhone').value = ''; load(); }\nasync function delSub(p) { await api('/sub-del', { phone: p }); load(); }\nasync function setDrop(k) { const s = await api('/state'); const d = s.drop || {}; const body = {}; body[k] = !(k === 'links' ? (d.links || s.linkOnlyAll) : d[k]); await api('/drop', body); load(); }\nasync function setDedup() { const s = await api('/state'); await api('/dedup', { off: !s.dedupOff }); load(); }\nasync function changeKey() {\n  const msg = document.getElementById('keyMsg');\n  const res = await fetch('/admin/api/admin-key', { method: 'POST', headers: { 'content-type': 'application/json', 'x-admin-key': KEY }, body: JSON.stringify({ current: document.getElementById('curKey').value, next: document.getElementById('newKey').value }) });\n  const j = await res.json().catch(() => ({}));\n  if (res.ok && j.ok) { KEY = document.getElementById('newKey').value; localStorage.setItem('buff_admin_key', KEY); msg.textContent = 'Key changed - you are now using the new key.'; }\n  else msg.textContent = j.error || 'Failed.';\n}\nasync function setPower() { const s = await api('/state'); const on = s.power === 'off'; if (!confirm(on ? 'Turn the bot ON? It resumes from now, no catch-up.' : 'Turn the bot fully OFF? Polling stops and the WhatsApp link suspends.')) return; const r = await api('/power', { on }); if (!r.ok) alert('Power switch had a problem: ' + JSON.stringify(r.steps)); load(); }\nif (KEY) load(); else showLogin();\n</script>\n</body>\n</html>\n";
 
+
+const XRELOGIN_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>BUFF - Reconnect X</title>
+<style>body{font:15px/1.5 -apple-system,system-ui,sans-serif;background:#0f1115;color:#e8eaf0;max-width:420px;margin:12vh auto;padding:0 16px}input{width:100%;box-sizing:border-box;background:#10141b;border:1px solid #262c38;color:#e8eaf0;border-radius:8px;padding:10px;margin:5px 0;font-size:14px}button{background:#4da3ff;border:0;border-radius:8px;padding:11px 16px;font-weight:600;width:100%;margin-top:10px;cursor:pointer}#out{margin-top:14px;font-size:14px;white-space:pre-wrap}.hint{color:#8b93a5;font-size:12px}</style></head><body>
+<h2>Reconnect X session</h2>
+<p class="hint">Runs the X login flow server-side and stores fresh session cookies. Values go straight from these fields to the worker - never displayed or logged.</p>
+<input type="password" id="ak" placeholder="Admin key" autocomplete="off">
+<input type="text" id="u" placeholder="X username or email" autocomplete="off">
+<input type="password" id="pw" placeholder="X password" autocomplete="off">
+<input type="text" id="em" placeholder="Account email (only if X asks)" autocomplete="off">
+<button onclick="go()">Reconnect</button>
+<div id="out"></div>
+<script>
+async function go(){
+  const out = document.getElementById('out');
+  out.textContent = 'Working... (X login flow can take 10-20s)';
+  try {
+    const r = await fetch('/admin/api/x-relogin', {method:'POST', headers:{'content-type':'application/json','x-admin-key':document.getElementById('ak').value.trim()}, body: JSON.stringify({username: document.getElementById('u').value.trim(), password: document.getElementById('pw').value, email: document.getElementById('em').value.trim()})});
+    const j = await r.json();
+    out.textContent = JSON.stringify(j, null, 2);
+  } catch(e){ out.textContent = 'request failed: ' + e.message; }
+}
+</script></body></html>`;
+
 const digits = (s) => String(s || "").replace(/\D/g, "");
 const cleanHandle = (s) => String(s || "").trim().replace(/^@/, "").replace(/[^A-Za-z0-9_]/g, "").slice(0, 20);
+
+
+// ---------- X session relogin (vault-transported credentials; cookies never leave this worker) ----------
+const X_SUBTASK_VERSIONS = {
+  action_list: 2, alert_dialog: 1, app_download_cta: 1, check_logged_in_account: 2, choice_selection: 3,
+  contacts_live_sync_permission_prompt: 0, cta: 7, email_verification: 2, end_flow: 1, enter_date: 1,
+  enter_email: 2, enter_password: 5, enter_phone: 2, enter_recaptcha: 1, enter_text: 5, generic_urt: 3,
+  in_app_notification: 1, interest_picker: 3, js_instrumentation: 1, menu_dialog: 1,
+  notifications_permission_prompt: 2, open_account: 2, open_home_timeline: 1, open_link: 1,
+  phone_verification: 4, privacy_options: 1, security_key: 3, select_avatar: 4, select_banner: 2,
+  settings_list: 7, show_code: 1, sign_up: 2, sign_up_review: 4, tweet_selection_urt: 1, update_users: 1,
+  upload_media: 1, user_recommendations_list: 4, user_recommendations_urt: 1, wait_spinner: 3, web_modal: 1,
+};
+const X_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+async function xLoginFlow(username, password, email, API_HOST) {
+  const jar = new Map();
+  const collect = (res) => {
+    for (const c of res.headers.getSetCookie ? res.headers.getSetCookie() : []) {
+      const [pair] = c.split(";");
+      const i = pair.indexOf("=");
+      if (i > 0) jar.set(pair.slice(0, i).trim(), pair.slice(i + 1).trim());
+    }
+  };
+  const baseHeaders = (gt) => ({
+    authorization: `Bearer ${X_BEARER}`,
+    "content-type": "application/json",
+    "user-agent": X_UA,
+    "x-twitter-active-user": "yes",
+    "x-twitter-client-language": "en",
+    origin: "https://x.com",
+    referer: "https://x.com/",
+    "x-guest-token": gt || "",
+    "x-csrf-token": jar.get("ct0") || "",
+    "x-twitter-auth-type": jar.has("auth_token") ? "OAuth2Client" : "",
+    cookie: [...jar.entries(), ...(gt && !jar.has("gt") ? [["gt", gt]] : [])].map(([k, v]) => `${k}=${v}`).join("; "),
+  });
+  const g = await fetch("https://" + API_HOST + "/1.1/guest/activate.json", { method: "POST", headers: baseHeaders(null), signal: AbortSignal.timeout(15000) });
+  collect(g);
+  if (!g.ok) return { error: "guest activate HTTP " + g.status };
+  const { guest_token } = await g.json();
+  if (!guest_token) return { error: "no guest token" };
+  let flowToken = null;
+  const seen = [];
+  let pendingInputs = null;
+  for (let step = 0; step < 14; step++) {
+    const body = flowToken
+      ? { flow_token: flowToken, subtask_inputs: pendingInputs }
+      : { input_flow_data: { flow_context: { debug_overrides: {}, start_location: { location: "manual_link" } }, subtask_versions: X_SUBTASK_VERSIONS } };
+    const res = await fetch("https://" + API_HOST + "/1.1/onboarding/task.json" + (flowToken ? "" : "?flow_name=login"), {
+      method: "POST", headers: baseHeaders(guest_token), body: JSON.stringify(body), signal: AbortSignal.timeout(15000),
+    });
+    collect(res);
+    const rawText = await res.text().catch(() => "");
+    let j = {}; try { j = JSON.parse(rawText); } catch (e) {}
+    if (!res.ok) return { error: "task HTTP " + res.status, detail: rawText.slice(0, 300), seen };
+    flowToken = j.flow_token;
+    const tasks = j.subtasks || [];
+    const subs = tasks.map((x) => x.subtask_id);
+    seen.push(...subs);
+    if (jar.has("auth_token") && jar.has("ct0")) return { auth_token: jar.get("auth_token"), ct0: jar.get("ct0"), seen };
+    const id = subs[0];
+    const task = tasks[0] || {};
+    if (id === "LoginJsInstrumentationSubtask") pendingInputs = [{ subtask_id: id, js_instrumentation: { response: '{\"rf\":{\"a4fc506d24bb4843c48a1966940c2796bf4fb7617a2d515ad3297b7df6b459b6\":121,\"bff66e16f1d7ea28c04653dc32479cf416a9c8b67c80cb8ad533b2a44fee82a3\":-1,\"ac4008077a7e6ca03210159dbe2134dea72a616f03832178314bb9931645e4f7\":-22,\"c3a8a81a9b2706c6fec42c771da65a9597c537b8e4d9b39e8e58de9fe31ff239\":-12},\"s\":\"ZHYaDA9iXRxOl2J3AZ9cc23iJx-Fg5E82KIBA_fgeZFugZGYzRtf8Bl3EUeeYgsK30gLFD2jTQx9fAMsnYCw0j8ahEy4Pb5siM5zD6n7YgOeWmFFaXoTwaGY4H0o-jQnZi5yWZRAnFi4lVuCVouNz_xd2BO2sobCO7QuyOsOxQn2CWx7bjD8vPAzT5BS1mICqUWyjZDjLnRZJU6cSQG5YFIHEPBa8Kj-v1JFgkdAfAMIdVvP7C80HWoOqYivQR7IBuOAI4xCeLQEdxlGeT-JYStlP9dcU5St7jI6ExyMeQnRicOcxXLXsan8i5Joautk2M8dAJFByzBaG4wtrPhQ3QAAAZEi-_t7\"}', link: "next_link" } }];
+    else if (id === "LoginEnterUserIdentifierSSO") pendingInputs = [{ subtask_id: id, settings_list: { setting_responses: [{ key: "user_identifier", response_data: { text_data: { result: username } } }], link: "next_link" } }];
+    else if (id === "LoginEnterUserIdentifier") pendingInputs = [{ subtask_id: id, enter_text: { text: username, link: "next_link" } }];
+    else if (id === "LoginEnterAlternateIdentifierSubtask") { if (!email) return { error: "X wants alternate identifier (email) but none given", seen }; pendingInputs = [{ subtask_id: id, enter_text: { text: email, link: "next_link" } }]; }
+    else if (id === "LoginEnterPassword") pendingInputs = [{ subtask_id: id, enter_password: { password, link: "next_link" } }];
+    else if (id === "AccountDuplicationCheck") pendingInputs = [{ subtask_id: id, check_logged_in_account: { link: "AccountDuplicationCheck_false" } }];
+    else if (id === "LoginAcid") {
+      const hint = (((task.enter_text || {}).hint_text) || "").toLowerCase();
+      if (hint.includes("confirmation code")) return { error: "X wants an email confirmation code", seen, needsCode: true };
+      if (!email) return { error: "X wants email confirmation (LoginAcid) but no email given", seen };
+      pendingInputs = [{ subtask_id: id, enter_text: { text: email, link: "next_link" } }];
+    }
+    else if (id === "LoginSuccessSubtask" || id === "SuccessExit") { if (jar.has("auth_token")) return { auth_token: jar.get("auth_token"), ct0: jar.get("ct0"), seen }; return { error: "success subtask but no auth_token cookie", seen }; }
+    else if (id === "DenyLoginSubtask") return { error: "X denied the login (DenyLoginSubtask)", seen };
+    else if (!id) { if (jar.has("auth_token")) return { auth_token: jar.get("auth_token"), ct0: jar.get("ct0"), seen }; return { error: "no subtasks and no auth_token", seen }; }
+    else return { error: "unhandled subtask: " + id, seen, needsManual: true };
+  }
+  return { error: "flow did not complete in 14 steps", seen };
+}
 
 async function adminAuthed(request, env) {
   const configured = (await env.BUFF_KV.get("admin_key")) || env.ADMIN_SECRET || null;
@@ -883,6 +988,46 @@ async function handleAdminApi(request, env, url) {
     // clean up any legacy KV copy so the secret binding is the only resting place
     try { await env.BUFF_KV.delete("gemini_key"); } catch (e) {}
     return Response.json({ ok: true, installed: "worker_secret" });
+  }
+  if (path === "/admin/api/x-relogin" && request.method === "POST") {
+    // Runs the X login flow server-side. Credentials arrive over HTTPS from the panel, cookies go straight to KV. Never logged, never returned.
+    const username = String(body.username || "").trim();
+    const password = String(body.password || "");
+    const email = String(body.email || "").trim();
+    if (!username || !password) return Response.json({ error: "username and password required" }, { status: 400 });
+    try {
+      let r = await xLoginFlow(username, password, email, "api.x.com");
+      if (!r.auth_token && /400|403/.test(String(r.error))) r = await xLoginFlow(username, password, email, "api.twitter.com");
+      if (!r.auth_token) return Response.json({ ok: false, error: r.error, detail: r.detail, seen: r.seen }, { status: 502 });
+      await env.BUFF_KV.put("x_session", JSON.stringify({ auth_token: r.auth_token, ct0: r.ct0, ts: Date.now() }));
+      // verify against the real list timeline before declaring success
+      let verify = "untested";
+      try {
+        const t = await fetchListTimeline(env); // reads the session we just wrote to KV
+        verify = t.length > 200 ? "ok" : "empty";
+      } catch (e) { verify = "verify failed: " + (e.message || e); }
+      return Response.json({ ok: true, stored: true, verify, seen: r.seen });
+    } catch (e) {
+      return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+    }
+  }
+  if (path === "/admin/api/x-session-set" && request.method === "POST") {
+    // Receives X session cookies over HTTPS, validates against the real list timeline, stores in KV only if valid. Never logged or returned.
+    const at = String(body.auth_token || "").trim();
+    const ct = String(body.ct0 || "").trim();
+    if (!at || !ct) return Response.json({ error: "auth_token and ct0 required" }, { status: 400 });
+    const vars = { listId: env.X_LIST_ID, count: 5 };
+    const url2 = `https://x.com/i/api/graphql/${QID_LIST}/ListLatestTweetsTimeline?variables=${encodeURIComponent(JSON.stringify(vars))}&features=${encodeURIComponent(JSON.stringify(X_FEATURES))}`;
+    try {
+      const res = await fetch(url2, { headers: { authorization: `Bearer ${X_BEARER}`, "x-csrf-token": ct, cookie: `auth_token=${at}; ct0=${ct}`, "user-agent": X_UA, "x-twitter-active-user": "yes", "x-twitter-auth-type": "OAuth2Session" }, signal: AbortSignal.timeout(20000) });
+      if (!res.ok) return Response.json({ ok: false, stored: false, verify: "HTTP " + res.status }, { status: 502 });
+      const t = await res.text();
+      if (t.length < 200) return Response.json({ ok: false, stored: false, verify: "empty response" }, { status: 502 });
+      await env.BUFF_KV.put("x_session", JSON.stringify({ auth_token: at, ct0: ct, ts: Date.now() }));
+      return Response.json({ ok: true, stored: true, verify: "ok" });
+    } catch (e) {
+      return Response.json({ ok: false, stored: false, verify: String(e.message || e) }, { status: 500 });
+    }
   }
   if (path === "/admin/api/gemini-test") {
     // Dry-run the gatekeeper against the most recent retained feed items. Returns verdicts, never the key.
@@ -1009,6 +1154,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === "/admin" && request.method === "GET") return new Response(ADMIN_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+    if (url.pathname === "/admin/x-relogin" && request.method === "GET") return new Response(XRELOGIN_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
     if (url.pathname.startsWith("/admin/api/")) return handleAdminApi(request, env, url);
     if (url.pathname === "/incoming" && request.method === "POST") return handleIncoming(request, env);
     if (url.pathname === "/health") {
