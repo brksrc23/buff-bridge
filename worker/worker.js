@@ -219,6 +219,83 @@ async function formatBody(t) {
   return `*${t.name} (@${t.handle})*\n\n${await clean(t.text)}`;
 }
 
+// ---------- Shabbos hold (2026-09-04, Ezra) ----------
+// Bot keeps polling/filtering/deduping, but WhatsApp delivery holds Fri evening -> Sat night (America/New_York).
+// Held posts are retained with held:true; at window end ONE Gemini digest goes out, then live delivery resumes
+// (held posts are already marked seen, so no backlog dump). Err longer: Fri 7:10 PM -> Sat 8:40 PM ET.
+// KV overrides: shabbos_auto="0" disables entirely; shabbos_force="on"/"off" for testing.
+async function shabbosHoldActive(env) {
+  try {
+    const force = await env.BUFF_KV.get("shabbos_force");
+    if (force === "on") return true;
+    if (force === "off") return false;
+    if ((await env.BUFF_KV.get("shabbos_auto")) === "0") return false;
+    const et = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+    const day = et.getDay(), mins = et.getHours() * 60 + et.getMinutes();
+    if (day === 5 && mins >= 19 * 60 + 10) return true;
+    if (day === 6 && mins < 20 * 60 + 40) return true;
+  } catch (e) {}
+  return false;
+}
+
+async function sendShabbosDigest(env, opts) {
+  const o = opts || {};
+  const items = o.items || (await getJSON(env, "shabbos_items", []));
+  let text;
+  if (!items.length) {
+    text = "*Shabbos rundown*\nAll quiet - nothing passed the filter in the last day.";
+  } else {
+    const brief = items.slice(-120).map((t) => ({ account: "@" + t.handle, text: (t.text || t.origText || "").slice(0, 180) }));
+    const prompt =
+      "You are writing a Shabbos rundown: a full-spectrum recap of these news posts (about 25 hours) for one WhatsApp user who was offline. " +
+      "Organize into topic SECTIONS with headers like *WORLD EVENTS*, *MIDDLE EAST*, *US POLITICS*, *WEATHER & DISASTERS*, *ECONOMY*, *OTHER* (use only sections that have content, most important first). " +
+      "Within each section, merge updates about the same event into one entry and give the key developments as concise bullets. Cover the whole window, not just the biggest stories. " +
+      "Plain text, WhatsApp formatting (*bold* headers, - bullets), no links, no hashtags. Posts:\n" +
+      JSON.stringify(brief);
+    let sections;
+    try {
+      const gemKey = await getGeminiKey(env);
+      if (!gemKey) throw new Error("no gemini key");
+      const res = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-goog-api-key": gemKey },
+        body: JSON.stringify({ model: GEMINI_MODEL, input: prompt, store: false, generation_config: { temperature: 0.2, max_output_tokens: 4000, thinking_level: "minimal" } }),
+        signal: AbortSignal.timeout(40000),
+      });
+      if (!res.ok) throw new Error("gemini HTTP " + res.status);
+      const data = await res.json();
+      const out = (data.steps || []).filter((st) => st && st.type === "model_output").flatMap((st) => st.content || []).filter((c) => c && c.type === "text").map((c) => c.text || "").join("").trim();
+      if (!out) throw new Error("empty digest");
+      sections = out;
+    } catch (e) {
+      // fallback: plain list of the most recent kept posts
+      const lines = items.slice(-20).map((t) => "- " + (t.text || t.origText || "").split("\n")[0].slice(0, 120));
+      sections = "*RECENT HEADLINES*\n" + lines.join("\n");
+    }
+    // split by whole sections if too long for one message (never mid-thought)
+    const parts = [];
+    let cur = "*Shabbos rundown*\n";
+    for (const chunk of sections.split(/(?=^\*[A-Z][^*\n]{2,}\*\s*$)/m)) {
+      if (cur.length + chunk.length > 3500 && cur.trim() !== "*Shabbos rundown*") { parts.push(cur); cur = ""; }
+      if (chunk.length > 3500) { // a single oversized section: hard-wrap at line boundaries
+        for (const line of chunk.split("\n")) {
+          if (cur.length + line.length + 1 > 3500) { parts.push(cur); cur = ""; }
+          cur += line + "\n";
+        }
+      } else cur += chunk;
+    }
+    if (cur.trim()) parts.push(cur);
+    if (o.dryRun) return parts;
+    for (const part of parts) { await deliverToAll(env, { text: part }); await sleep(400); }
+    if (!o.items) { try { await env.BUFF_KV.delete("shabbos_items"); } catch (e) {} }
+    return;
+  }
+  // empty-window path: text holds the "all quiet" note
+  if (o.dryRun) return [text];
+  await deliverToAll(env, { text });
+  if (!o.items) { try { await env.BUFF_KV.delete("shabbos_items"); } catch (e) {} }
+}
+
 // ---------- bridge delivery ----------
 
 async function bridgeSend(env, payload, to) {
@@ -464,6 +541,10 @@ async function poll(env, maxDeliver) {
   const retained = []; // pushed into feed_items at the end (one batched write)
   const stories = (await getJSON(env, STORIES_KEY, [])).filter((s) => Date.now() - s.at < 24 * 3600 * 1000); // delivered-story fingerprints, 24h window; tick-local appends make same-tick dupes deterministic
   let storyDupes = 0;
+  const shabbos = await shabbosHoldActive(env);
+  if (shabbos) { try { if (!(await env.BUFF_KV.get("shabbos_digest_pending"))) await env.BUFF_KV.put("shabbos_digest_pending", String(Date.now())); } catch (e) {} }
+  let held = 0;
+  const heldItems = []; // batched into shabbos_items at tick end (survives the whole window, unlike 400-cap feed_items)
 
   // pending adds: confirm once a staged account actually shows up in the list timeline
   const pendingAdds = await getPendingAdds(env);
@@ -531,6 +612,19 @@ async function poll(env, maxDeliver) {
       deferred++;
       continue;
     }
+    if (shabbos) {
+      // hold: buffer what passed the filter for the end-of-Shabbos digest; mark seen so live delivery resumes from NOW
+      retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), held: true });
+      try {
+        const hfp = storyFp([t.text, t.origText, t.quotedText].filter(Boolean).join(" "));
+        if (isStoryDupeFp(hfp, stories)) { await env.BUFF_KV.put(`seen:${t.id}`, "1", { expirationTtl: 14 * 86400 }); storyDupes++; continue; }
+        if (hfp.u.size) stories.push({ u: [...hfp.u].slice(0, 60), e: [...hfp.e].slice(0, 40), at: Date.now() });
+      } catch (e) {}
+      await env.BUFF_KV.put(`seen:${t.id}`, "1", { expirationTtl: 14 * 86400 });
+      heldItems.push(retained[retained.length - 1]);
+      held++;
+      continue;
+    }
     if (maxDeliver && delivered >= maxDeliver) break; // leave the rest unseen for the next tick
     // story-level dedup: same story already delivered from another account -> suppress (fail-open on any error)
     let fp = null;
@@ -565,6 +659,13 @@ async function poll(env, maxDeliver) {
     }
   }
   try { await env.BUFF_KV.put(STORIES_KEY, JSON.stringify(stories.slice(-120))); } catch (e) {}
+  if (heldItems.length) {
+    try {
+      const buf = await getJSON(env, "shabbos_items", []);
+      buf.push(...heldItems);
+      await env.BUFF_KV.put("shabbos_items", JSON.stringify(buf.slice(-300)));
+    } catch (e) {}
+  }
   if (retained.length) {
     const items = await getFeedItems(env);
     items.push(...retained);
@@ -576,7 +677,7 @@ async function poll(env, maxDeliver) {
     vol.delivered += delivered; vol.suppressed += suppressed; vol.filtered += filtered; vol.deferred += deferred;
     await env.BUFF_KV.put(vkey, JSON.stringify(vol), { expirationTtl: 7 * 86400 });
   }
-  return `delivered=${delivered} dropped=${dropped} skipped=${skipped} filtered=${filtered} deferred=${deferred} suppressed=${suppressed}${storyDupes ? ` storydupes=${storyDupes}` : ""}${paused ? " paused" : ""}${waDown ? " wa_down" : ""}`;
+  return `delivered=${delivered} dropped=${dropped} skipped=${skipped} filtered=${filtered} deferred=${deferred} suppressed=${suppressed}${storyDupes ? ` storydupes=${storyDupes}` : ""}${held ? ` held=${held}` : ""}${shabbos ? " shabbos" : ""}${paused ? " paused" : ""}${waDown ? " wa_down" : ""}`;
 }
 
 // ---------- commands ----------
@@ -785,7 +886,11 @@ const DEFAULT_RULES = [
 const VALID_MODES = ["everything", "breaking", "custom"];
 const getMode = async (env) => { const m = await env.BUFF_KV.get("feed_mode"); return VALID_MODES.includes(m) ? m : "everything"; };
 const getRules = (env) => getJSON(env, "gemini_rules", DEFAULT_RULES);
-const getAcctRules = (env) => getJSON(env, "acct_rules", {}); // {handleLower: "natural-language rule"}
+const DEFAULT_ACCT_RULES = {
+  dd_geopolitics: "Deliver only hard footage and verified visual evidence posts (strike aftermath, geolocated video). Drop anything with opinion, framing, or editorial commentary.",
+  nypost: "Deliver ONLY hard national breaking news: major crime with national significance, politics/government, national emergencies. Drop tabloid, celebrity, sports, lifestyle, and outrage-bait content entirely.",
+};
+const getAcctRules = async (env) => ({ ...DEFAULT_ACCT_RULES, ...(await getJSON(env, "acct_rules", {})) }); // KV overrides win; defaults ship in code
 const getGeminiKey = async (env) => env.GEMINI_API_KEY || (await env.BUFF_KV.get("gemini_key")) || null;
 
 // Classify a batch of candidate posts. FAIL-OPEN: any error, timeout, or malformed answer -> deliver everything.
@@ -1128,6 +1233,14 @@ async function handleAdminApi(request, env, url) {
       return Response.json({ ok: false, stored: false, verify: String(e.message || e) }, { status: 500 });
     }
   }
+  if (path === "/admin/api/shabbos-preview") {
+    // Dry-run the Shabbos digest against recent kept feed items (or the live shabbos_items buffer). Sends nothing.
+    const buf = await getJSON(env, "shabbos_items", []);
+    const items = buf.length ? buf : (await getFeedItems(env)).slice(-40);
+    const parts = await sendShabbosDigest(env, { items, dryRun: true });
+    return Response.json({ ok: true, buffered: buf.length, used: items.length, parts: parts && parts.length ? parts.length : 0, preview: parts });
+  }
+
   if (path === "/admin/api/gemini-test") {
     // Dry-run the gatekeeper against the most recent retained feed items. Returns verdicts, never the key.
     const key = await getGeminiKey(env);
@@ -1248,6 +1361,13 @@ export default {
             if (!prev || prev.slice(24) !== msg.slice(24)) await env.BUFF_KV.put("last_error", msg);
           } catch (e2) {}
         }
+        // Shabbos release: window over + digest pending -> send the one rundown, then live delivery resumes
+        try {
+          if (!(await shabbosHoldActive(env)) && (await env.BUFF_KV.get("shabbos_digest_pending"))) {
+            await env.BUFF_KV.delete("shabbos_digest_pending");
+            await sendShabbosDigest(env);
+          }
+        } catch (e) {}
       })()
     );
   },
