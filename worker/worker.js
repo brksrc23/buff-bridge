@@ -246,7 +246,7 @@ async function getShabbosWindow(env) {
   if (cached && cached.zip === zip && cached.end && Date.parse(cached.end) > now) return cached;
   const fresh = await fetchShabbosWindow(zip);
   if (fresh) {
-    try { await env.BUFF_KV.put("shabbos_times", JSON.stringify(fresh)); } catch (e) {}
+    try { await kvPut(env, "shabbos_times", JSON.stringify(fresh)); } catch (e) {}
     return fresh;
   }
   return cached && cached.end && Date.parse(cached.end) > now ? cached : null;
@@ -364,7 +364,7 @@ async function deliverToAll(env, payload) {
     const id = await bridgeSend(env, payload, to);
     if (id) {
       // Plan B auto-clear: log every feed message so the poll loop can delete it for everyone after 24h
-      try { await env.BUFF_KV.put(`sent:${to}:${id}`, String(Date.now()), { expirationTtl: 26 * 3600 }); } catch (e) {}
+      try { await kvPut(env, `sent:${to}:${id}`, String(Date.now()), { expirationTtl: 26 * 3600 }); } catch (e) {}
     }
     if (!firstId) firstId = id;
     await sleep(250);
@@ -483,7 +483,7 @@ async function deliverTweet(env, t) {
     if (fp) {
       const dupe = await env.BUFF_KV.get(`media:${fp}`);
       if (dupe) { suppressed++; continue; } // exact media already sent (boilerplate logos, cross-account re-uploads) - suppress, text+link still goes
-      await env.BUFF_KV.put(`media:${fp}`, t.id, { expirationTtl: 14 * 86400 });
+      await kvPut(env, `media:${fp}`, t.id, { expirationTtl: 14 * 86400 });
     }
     await deliverToAll(env, m.kind === "image" ? { imageUrl: m.url } : { videoUrl: m.url });
     await sleep(250);
@@ -493,6 +493,15 @@ async function deliverTweet(env, t) {
 }
 
 // ---------- state helpers (batched KV keys to stay under free-tier write quota) ----------
+
+// Fail-soft KV write: when the free-tier daily write budget is exhausted, puts throw - skip writes for 5 min
+// instead of dying mid-tick, so polling/classification/digest continue (state just doesn't persist until reset).
+let KV_DEAD_UNTIL = 0;
+async function kvPut(env, key, value, opts) {
+  if (Date.now() < KV_DEAD_UNTIL) return false;
+  try { await env.BUFF_KV.put(key, value, opts); return true; }
+  catch (e) { if (String(e && e.message || e).includes("limit exceeded")) KV_DEAD_UNTIL = Date.now() + 5 * 60 * 1000; return false; }
+}
 
 async function getJSON(env, key, fallback) {
   try { const v = await env.BUFF_KV.get(key); return v ? JSON.parse(v) : fallback; } catch (e) { return fallback; }
@@ -542,16 +551,20 @@ function passesFilters(t, filters) {
 
 // ---------- poll ----------
 
-async function poll(env, maxDeliver) {
+async function poll(env, maxDeliver, diag) {
+  const d = diag || null;
+  const mark = (k) => { if (d) d[k] = Date.now() - d._t0; };
+  if (d) d._t0 = Date.now();
   if (!env.X_LIST_ID) return "no list id - skipping";
   const raw = await fetchListTimeline(env);
+  if (d) { d.rawBytes = raw.length; mark("tFetch"); }
   const ids = [...new Set([...raw.matchAll(/"entryId":"tweet-(\d+)"/g)].map((m) => m[1]))];
   if (!ids.length) return "timeline empty";
 
   const seeded = await env.BUFF_KV.get("seeded");
   if (!seeded) {
-    for (const id of ids) await env.BUFF_KV.put(`seen:${id}`, "1", { expirationTtl: 14 * 86400 });
-    await env.BUFF_KV.put("seeded", "1");
+    for (const id of ids) await kvPut(env, `seen:${id}`, "1", { expirationTtl: 14 * 86400 });
+    await kvPut(env, "seeded", "1");
     return `seeded ${ids.length} tweets, delivered none`;
   }
 
@@ -573,7 +586,10 @@ async function poll(env, maxDeliver) {
   if (!unseen.length) return `delivered=0 dropped=0 skipped=${skipped} filtered=0 deferred=0${paused ? " paused" : ""}${waDown ? " wa_down" : ""} scan-quiet`;
 
   const payload = JSON.parse(raw);
+  mark("tParse");
   const tweets = extractTweets(payload);
+  if (d) d.tweets = tweets.length;
+  mark("tExtract");
   const byId = new Map(tweets.map((t) => [t.id, t]));
   const filters = await getFilters(env);
   const watches = await getWatches(env);
@@ -581,7 +597,7 @@ async function poll(env, maxDeliver) {
   const stories = (await getJSON(env, STORIES_KEY, [])).filter((s) => Date.now() - s.at < 24 * 3600 * 1000); // delivered-story fingerprints, 24h window; tick-local appends make same-tick dupes deterministic
   let storyDupes = 0;
   const shabbos = await shabbosHoldActive(env);
-  if (shabbos) { try { if (!(await env.BUFF_KV.get("shabbos_digest_pending"))) await env.BUFF_KV.put("shabbos_digest_pending", String(Date.now())); } catch (e) {} }
+  if (shabbos) { try { if (!(await env.BUFF_KV.get("shabbos_digest_pending"))) await kvPut(env, "shabbos_digest_pending", String(Date.now())); } catch (e) {} }
   let held = 0;
   let shabbosProcessed = 0; // per-tick processing cap during the hold (see break below)
   const heldItems = []; // batched into shabbos_items at tick end (survives the whole window, unlike 400-cap feed_items)
@@ -592,7 +608,7 @@ async function poll(env, maxDeliver) {
     const seenHandles = new Set(tweets.map((t) => t.handle.toLowerCase()));
     const confirmed = pendingAdds.filter((p) => seenHandles.has(p.handle.toLowerCase()));
     if (confirmed.length) {
-      await env.BUFF_KV.put("pending_adds", JSON.stringify(pendingAdds.filter((p) => !seenHandles.has(p.handle.toLowerCase()))));
+      await kvPut(env, "pending_adds", JSON.stringify(pendingAdds.filter((p) => !seenHandles.has(p.handle.toLowerCase()))));
       await bridgeSend(env, { text: `Now seeing posts from ${confirmed.map((p) => "@" + p.handle).join(", ")} - add complete.` }, String(env.ADMIN_PHONE).replace(/\D/g, "")).catch(() => {});
     }
   }
@@ -623,9 +639,12 @@ async function poll(env, maxDeliver) {
         candidates.push(pre[i]);
         if (candidates.length >= cap) break;
       }
+      if (d) d.candidates = candidates.length;
+      mark("tPreClassify");
       if (candidates.length) {
         const verdicts = await geminiClassify(env, gemKey, rules, feedMode, candidates, await getAcctRules(env));
-        for (const [vid, gv] of verdicts) await env.BUFF_KV.put(`gem:${vid}`, JSON.stringify(gv), { expirationTtl: 14 * 86400 });
+        mark("tClassify");
+        for (const [vid, gv] of verdicts) await kvPut(env, `gem:${vid}`, JSON.stringify(gv), { expirationTtl: 14 * 86400 });
       }
     }
   }
@@ -636,13 +655,13 @@ async function poll(env, maxDeliver) {
     if (!t) continue;
     // reply filter: drop replies to OTHER users; keep originals + self-thread continuations
     if (t.replyToUserId && t.authorId && t.replyToUserId !== t.authorId) {
-      await env.BUFF_KV.put(`seen:${id}`, "1", { expirationTtl: 14 * 86400 });
+      await kvPut(env, `seen:${id}`, "1", { expirationTtl: 14 * 86400 });
       skipped++;
       continue;
     }
     if (!passesFilters(t, filters)) {
       retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now() });
-      await env.BUFF_KV.put(`seen:${id}`, "1", { expirationTtl: 14 * 86400 });
+      await kvPut(env, `seen:${id}`, "1", { expirationTtl: 14 * 86400 });
       filtered++;
       continue;
     }
@@ -650,14 +669,14 @@ async function poll(env, maxDeliver) {
       const gv = parseGem(await env.BUFF_KV.get(`gem:${id}`));
       if (gv && gv.d === false) { // gatekeeper dropped it: retain for queries, never deliver
         retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now() });
-        await env.BUFF_KV.put(`seen:${id}`, "1", { expirationTtl: 14 * 86400 });
+        await kvPut(env, `seen:${id}`, "1", { expirationTtl: 14 * 86400 });
         filtered++;
         continue;
       }
     }
     if (holding) {
       retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now() });
-      await env.BUFF_KV.put(`seen:${id}`, "1", { expirationTtl: 14 * 86400 });
+      await kvPut(env, `seen:${id}`, "1", { expirationTtl: 14 * 86400 });
       deferred++;
       continue;
     }
@@ -667,10 +686,10 @@ async function poll(env, maxDeliver) {
       try {
         const hfp = storyFp([t.text, t.origText, t.quotedText].filter(Boolean).join(" "));
         const hasMedia = (t.media || []).length > 0; // new photos/videos/angles of an event are NOT dupes (2026-09-04 Ezra); identical media is already caught by media memory
-        if (!hasMedia && isStoryDupeFp(hfp, stories)) { await env.BUFF_KV.put(`seen:${t.id}`, "1", { expirationTtl: 14 * 86400 }); storyDupes++; if (++shabbosProcessed >= 15) break; continue; }
+        if (!hasMedia && isStoryDupeFp(hfp, stories)) { await kvPut(env, `seen:${t.id}`, "1", { expirationTtl: 14 * 86400 }); storyDupes++; if (++shabbosProcessed >= 15) break; continue; }
         if (hfp.u.size) stories.push({ u: [...hfp.u].slice(0, 60), e: [...hfp.e].slice(0, 40), at: Date.now() });
       } catch (e) {}
-      await env.BUFF_KV.put(`seen:${t.id}`, "1", { expirationTtl: 14 * 86400 });
+      await kvPut(env, `seen:${t.id}`, "1", { expirationTtl: 14 * 86400 });
       heldItems.push(retained[retained.length - 1]);
       held++;
       if (++shabbosProcessed >= 15) break; // bound tick wall-time during the hold; the rest stay unseen for the next tick
@@ -684,7 +703,7 @@ async function poll(env, maxDeliver) {
       const hasMedia = (t.media || []).length > 0; // new photos/videos/angles of an event are NOT dupes (2026-09-04 Ezra)
       if (!hasMedia && isStoryDupeFp(fp, stories)) {
           retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), storyDupe: true });
-          await env.BUFF_KV.put(`seen:${t.id}`, "1", { expirationTtl: 14 * 86400 });
+          await kvPut(env, `seen:${t.id}`, "1", { expirationTtl: 14 * 86400 });
           storyDupes++;
           continue;
       }
@@ -697,37 +716,38 @@ async function poll(env, maxDeliver) {
       if (hit) {
         await bridgeSend(env, { text: `Watch hit for "${hit.phrase}": see the post above from ${t.name} (@${t.handle}).` }, String(env.ADMIN_PHONE).replace(/\D/g, "")).catch(() => {});
       }
-      await env.BUFF_KV.put(`seen:${id}`, "1", { expirationTtl: 14 * 86400 }); // mark seen only AFTER successful send
+      await kvPut(env, `seen:${id}`, "1", { expirationTtl: 14 * 86400 }); // mark seen only AFTER successful send
       delivered++;
       await sleep(250);
     } catch (e) {
       if (e.bridgeDown) {
         // bridge not connected: trip circuit breaker, defer everything unsent
-        await env.BUFF_KV.put("wa_down", String(Date.now()), { expirationTtl: 3600 });
+        await kvPut(env, "wa_down", String(Date.now()), { expirationTtl: 3600 });
         deferred++;
         break;
       }
       throw e;
     }
   }
-  try { await env.BUFF_KV.put(STORIES_KEY, JSON.stringify(stories.slice(-120))); } catch (e) {}
+  try { await kvPut(env, STORIES_KEY, JSON.stringify(stories.slice(-120))); } catch (e) {}
   if (heldItems.length) {
     try {
       const buf = await getJSON(env, "shabbos_items", []);
       buf.push(...heldItems);
-      await env.BUFF_KV.put("shabbos_items", JSON.stringify(buf.slice(-300)));
+      await kvPut(env, "shabbos_items", JSON.stringify(buf.slice(-300)));
     } catch (e) {}
   }
+  mark("tLoop");
   if (retained.length) {
     const items = await getFeedItems(env);
     items.push(...retained);
-    await env.BUFF_KV.put(FEED_ITEMS_KEY, JSON.stringify(items.slice(-FEED_ITEMS_MAX)));
+    await kvPut(env, FEED_ITEMS_KEY, JSON.stringify(items.slice(-FEED_ITEMS_MAX)));
     // volume stats for the dashboard: one read-modify-write per poll, not per tweet
     const vday = new Date().toISOString().slice(0, 10);
     const vkey = `vol:${vday}`;
     const vol = (await getJSON(env, vkey, null)) || { delivered: 0, suppressed: 0, filtered: 0, deferred: 0 };
     vol.delivered += delivered; vol.suppressed += suppressed; vol.filtered += filtered; vol.deferred += deferred;
-    await env.BUFF_KV.put(vkey, JSON.stringify(vol), { expirationTtl: 7 * 86400 });
+    await kvPut(env, vkey, JSON.stringify(vol), { expirationTtl: 7 * 86400 });
   }
   return `delivered=${delivered} dropped=${dropped} skipped=${skipped} filtered=${filtered} deferred=${deferred} suppressed=${suppressed}${storyDupes ? ` storydupes=${storyDupes}` : ""}${held ? ` held=${held}` : ""}${shabbos ? " shabbos" : ""}${paused ? " paused" : ""}${waDown ? " wa_down" : ""}`;
 }
@@ -766,22 +786,22 @@ async function handleCommand(env, from, textRaw) {
   if (m === "help") return reply(isAdmin ? HELP_ADMIN : HELP_SUB);
 
   if (m === "pause") {
-    if (isAdmin) { await env.BUFF_KV.put("feed_paused", "1"); return reply("Feed paused. Nothing sends until you text: start"); }
+    if (isAdmin) { await kvPut(env, "feed_paused", "1"); return reply("Feed paused. Nothing sends until you text: start"); }
     sub.paused = true;
-    await env.BUFF_KV.put("subscribers", JSON.stringify(subs));
+    await kvPut(env, "subscribers", JSON.stringify(subs));
     return reply("Your messages are paused. Text: start - to resume.");
   }
   if (m === "start") {
     if (isAdmin) { await env.BUFF_KV.delete("feed_paused"); return reply("Feed started."); }
     sub.paused = false;
-    await env.BUFF_KV.put("subscribers", JSON.stringify(subs));
+    await kvPut(env, "subscribers", JSON.stringify(subs));
     return reply("You're back on.");
   }
   if (!isAdmin) return reply(HELP_SUB); // subscribers: nothing else
 
   const modeM = m.match(/^mode\s+(everything|breaking|custom)$/);
   if (modeM) {
-    await env.BUFF_KV.put("feed_mode", modeM[1]);
+    await kvPut(env, "feed_mode", modeM[1]);
     return reply(`Mode set: ${modeM[1]}.`);
   }
 
@@ -794,13 +814,13 @@ async function handleCommand(env, from, textRaw) {
     const wasMuted = filters.muted.map((x) => x.toLowerCase()).includes(h.toLowerCase());
     if (wasMuted) {
       filters.muted = filters.muted.filter((x) => x.toLowerCase() !== h.toLowerCase());
-      await env.BUFF_KV.put("filters_v1", JSON.stringify(filters));
+      await kvPut(env, "filters_v1", JSON.stringify(filters));
       return reply(`@${h} unmuted - posts flow again immediately.`);
     }
     const pending = await getPendingAdds(env);
     if (pending.some((p) => p.handle.toLowerCase() === h.toLowerCase())) return reply(`@${h} is already queued for the X list.`);
     pending.push({ handle: h, at: Date.now() });
-    await env.BUFF_KV.put("pending_adds", JSON.stringify(pending));
+    await kvPut(env, "pending_adds", JSON.stringify(pending));
     return reply(`@${h} queued. X is throttling list edits right now, so the list add happens when that clears - I'll confirm the moment @${h}'s posts actually start flowing.`);
   }
   const rmM = text.match(/^(?:remove|rm)\s+@?([A-Za-z0-9_]{1,15})\s*$/i);
@@ -811,10 +831,10 @@ async function handleCommand(env, from, textRaw) {
   const retained = []; // pushed into feed_items at the end (one batched write)
     if (!filters.muted.map((x) => x.toLowerCase()).includes(h.toLowerCase())) {
       filters.muted.push(h);
-      await env.BUFF_KV.put("filters_v1", JSON.stringify(filters));
+      await kvPut(env, "filters_v1", JSON.stringify(filters));
     }
     const pending = (await getPendingAdds(env)).filter((p) => p.handle.toLowerCase() !== h.toLowerCase());
-    await env.BUFF_KV.put("pending_adds", JSON.stringify(pending));
+    await kvPut(env, "pending_adds", JSON.stringify(pending));
     return reply(`@${h} muted - their posts stop right now. (X list removal follows when list edits un-throttle; the mute alone is enough.)`);
   }
   const fM = text.match(/^filter\s+@?([A-Za-z0-9_*]{1,15}|all)\s+linksonly\s+(on|off)\s*$/i);
@@ -826,7 +846,7 @@ async function handleCommand(env, from, textRaw) {
     const has = filters.linkOnly.map((x) => x.toLowerCase()).includes(k.toLowerCase());
     if (fM[2].toLowerCase() === "on" && !has) filters.linkOnly.push(k);
     if (fM[2].toLowerCase() === "off") filters.linkOnly = filters.linkOnly.filter((x) => x.toLowerCase() !== k.toLowerCase());
-    await env.BUFF_KV.put("filters_v1", JSON.stringify(filters));
+    await kvPut(env, "filters_v1", JSON.stringify(filters));
     return reply(`Link-only filter for ${k === "*" ? "ALL accounts" : "@" + k}: ${fM[2].toUpperCase()}.`);
   }
   if (m === "filters") {
@@ -841,12 +861,12 @@ async function handleCommand(env, from, textRaw) {
     if (subM[1].toLowerCase() === "add") {
       if (phone === String(env.ADMIN_PHONE).replace(/\D/g, "") || subs.some((s) => s.phone === phone)) return reply("That number is already on the feed.");
       subs.push({ phone, paused: false, at: Date.now() });
-      await env.BUFF_KV.put("subscribers", JSON.stringify(subs));
+      await kvPut(env, "subscribers", JSON.stringify(subs));
       await bridgeSend(env, { text: "You've been added to Buff, an X news feed. Text: pause - anytime to stop, or: help." }, phone).catch(() => {});
       return reply(`Subscriber added: +${phone}. They got a welcome note with pause/help.`);
     }
     const next = subs.filter((s) => s.phone !== phone);
-    await env.BUFF_KV.put("subscribers", JSON.stringify(next));
+    await kvPut(env, "subscribers", JSON.stringify(next));
     return reply(next.length === subs.length ? `+${phone} wasn't a subscriber.` : `+${phone} removed.`);
   }
   if (m === "subscribers") {
@@ -865,7 +885,7 @@ async function handleCommand(env, from, textRaw) {
     const phrase = watchAddM[1].trim().toLowerCase();
     if (watches.some((x) => x.phrase === phrase)) return reply(`Already watching "${phrase}".`);
     watches.push({ phrase, at: Date.now() });
-    await env.BUFF_KV.put("watches", JSON.stringify(watches));
+    await kvPut(env, "watches", JSON.stringify(watches));
     return reply(`Watching "${phrase}" - I'll flag it whenever a tracked account posts about it.`);
   }
   const watchRmM = text.match(/^(?:unwatch|watch remove|remove watch)\s+(.{2,60})$/i);
@@ -873,7 +893,7 @@ async function handleCommand(env, from, textRaw) {
     const watches = await getWatches(env);
     const phrase = watchRmM[1].trim().toLowerCase();
     const next = watches.filter((x) => x.phrase !== phrase);
-    await env.BUFF_KV.put("watches", JSON.stringify(next));
+    await kvPut(env, "watches", JSON.stringify(next));
     return reply(next.length === watches.length ? `No watch on "${phrase}".` : `Watch removed: "${phrase}".`);
   }
   if (m === "watches") {
@@ -996,7 +1016,7 @@ async function geminiClassify(env, key, rules, mode, tweets, acctRules) {
     const day = new Date().toISOString().slice(0, 10);
     const ukey = `gem_usage:${day}`;
     const used = parseInt((await env.BUFF_KV.get(ukey)) || "0", 10) + 1;
-    await env.BUFF_KV.put(ukey, String(used), { expirationTtl: 3 * 86400 });
+    await kvPut(env, ukey, String(used), { expirationTtl: 3 * 86400 });
   } catch (e) { /* fail open */ }
   return verdicts;
 }
@@ -1182,11 +1202,11 @@ async function handleAdminApi(request, env, url) {
   }
 
   if (path === "/admin/api/pause") {
-    if (body.paused) await env.BUFF_KV.put("feed_paused", "1"); else await env.BUFF_KV.delete("feed_paused");
+    if (body.paused) await kvPut(env, "feed_paused", "1"); else await env.BUFF_KV.delete("feed_paused");
     return Response.json({ ok: true });
   }
   if (path === "/admin/api/mode" && VALID_MODES.includes(body.mode)) {
-    await env.BUFF_KV.put("feed_mode", body.mode);
+    await kvPut(env, "feed_mode", body.mode);
     return Response.json({ ok: true });
   }
   if (path === "/admin/api/mute" || path === "/admin/api/linkonly") {
@@ -1200,18 +1220,18 @@ async function handleAdminApi(request, env, url) {
     const i = low.indexOf(h.toLowerCase());
     if (on && i < 0) filters[list].push(h);
     if (!on && i >= 0) filters[list].splice(i, 1);
-    await env.BUFF_KV.put("filters_v1", JSON.stringify(filters));
+    await kvPut(env, "filters_v1", JSON.stringify(filters));
     return Response.json({ ok: true });
   }
   if (path === "/admin/api/drop") {
     const filters = await getFilters(env);
     filters.drop = filters.drop || {};
     for (const k of ["links", "video", "image", "gif"]) if (k in body) filters.drop[k] = !!body[k];
-    await env.BUFF_KV.put("filters_v1", JSON.stringify(filters));
+    await kvPut(env, "filters_v1", JSON.stringify(filters));
     return Response.json({ ok: true });
   }
   if (path === "/admin/api/dedup") {
-    if (body.off) await env.BUFF_KV.put("dedup_off", "1"); else await env.BUFF_KV.delete("dedup_off");
+    if (body.off) await kvPut(env, "dedup_off", "1"); else await env.BUFF_KV.delete("dedup_off");
     return Response.json({ ok: true });
   }
   if (path === "/admin/api/add-account") {
@@ -1220,13 +1240,13 @@ async function handleAdminApi(request, env, url) {
     const pending = await getPendingAdds(env);
     if (!pending.some((p) => String(p.handle).toLowerCase() === h.toLowerCase())) {
       pending.push({ handle: h, at: Date.now() });
-      await env.BUFF_KV.put("pending_adds", JSON.stringify(pending));
+      await kvPut(env, "pending_adds", JSON.stringify(pending));
     }
     return Response.json({ ok: true, staged: h });
   }
   if (path === "/admin/api/rules" && Array.isArray(body.rules)) {
     const rules = body.rules.map((r) => String(r).slice(0, 500)).filter(Boolean).slice(0, 40);
-    await env.BUFF_KV.put("gemini_rules", JSON.stringify(rules));
+    await kvPut(env, "gemini_rules", JSON.stringify(rules));
     return Response.json({ ok: true, count: rules.length });
   }
   if (path === "/admin/api/gemini-key") {
@@ -1256,7 +1276,7 @@ async function handleAdminApi(request, env, url) {
       let r = await xLoginFlow(username, password, email, "api.x.com");
       if (!r.auth_token && /400|403/.test(String(r.error))) r = await xLoginFlow(username, password, email, "api.twitter.com");
       if (!r.auth_token) return Response.json({ ok: false, error: r.error, detail: r.detail, seen: r.seen }, { status: 502 });
-      await env.BUFF_KV.put("x_session", JSON.stringify({ auth_token: r.auth_token, ct0: r.ct0, ts: Date.now() }));
+      await kvPut(env, "x_session", JSON.stringify({ auth_token: r.auth_token, ct0: r.ct0, ts: Date.now() }));
       // verify against the real list timeline before declaring success
       let verify = "untested";
       try {
@@ -1280,7 +1300,7 @@ async function handleAdminApi(request, env, url) {
       if (!res.ok) return Response.json({ ok: false, stored: false, verify: "HTTP " + res.status }, { status: 502 });
       const t = await res.text();
       if (t.length < 200) return Response.json({ ok: false, stored: false, verify: "empty response" }, { status: 502 });
-      await env.BUFF_KV.put("x_session", JSON.stringify({ auth_token: at, ct0: ct, ts: Date.now() }));
+      await kvPut(env, "x_session", JSON.stringify({ auth_token: at, ct0: ct, ts: Date.now() }));
       return Response.json({ ok: true, stored: true, verify: "ok" });
     } catch (e) {
       return Response.json({ ok: false, stored: false, verify: String(e.message || e) }, { status: 500 });
@@ -1323,7 +1343,7 @@ async function handleAdminApi(request, env, url) {
     if (body.current !== configured) return Response.json({ error: "current key wrong" }, { status: 403 });
     const next = String(body.next || "").trim();
     if (next.length < 8) return Response.json({ error: "new key must be 8+ chars" }, { status: 400 });
-    await env.BUFF_KV.put("admin_key", next);
+    await kvPut(env, "admin_key", next);
     return Response.json({ ok: true });
   }
   if (path === "/admin/api/acct-rule") {
@@ -1332,7 +1352,7 @@ async function handleAdminApi(request, env, url) {
     const rules = await getAcctRules(env);
     const rule = String(body.rule || "").trim().slice(0, 500);
     if (rule) rules[h.toLowerCase()] = rule; else delete rules[h.toLowerCase()];
-    await env.BUFF_KV.put("acct_rules", JSON.stringify(rules));
+    await kvPut(env, "acct_rules", JSON.stringify(rules));
     return Response.json({ ok: true });
   }
   if (path === "/admin/api/remove-account") {
@@ -1343,12 +1363,12 @@ async function handleAdminApi(request, env, url) {
     filters.muted = filters.muted || [];
     if (!filters.muted.map((x) => String(x).toLowerCase()).includes(h.toLowerCase())) {
       filters.muted.push(h);
-      await env.BUFF_KV.put("filters_v1", JSON.stringify(filters));
+      await kvPut(env, "filters_v1", JSON.stringify(filters));
     }
     const rem = await getJSON(env, "pending_removals", []);
     if (!rem.some((r) => String(r.handle).toLowerCase() === h.toLowerCase())) {
       rem.push({ handle: h, at: Date.now() });
-      await env.BUFF_KV.put("pending_removals", JSON.stringify(rem));
+      await kvPut(env, "pending_removals", JSON.stringify(rem));
     }
     return Response.json({ ok: true, muted: h, queued: true });
   }
@@ -1362,7 +1382,7 @@ async function handleAdminApi(request, env, url) {
     } else {
       steps.cron = await cfSchedules(env, false);
       steps.bridge = await renderPower(env, "suspend");
-      await env.BUFF_KV.put("bot_power", "off");
+      await kvPut(env, "bot_power", "off");
     }
     return Response.json({ ok: Object.values(steps).every((s) => s.ok !== false), on, steps });
   }
@@ -1375,7 +1395,7 @@ async function handleAdminApi(request, env, url) {
     } else {
       watches = watches.filter((w) => w.phrase.toLowerCase() !== phrase.toLowerCase());
     }
-    await env.BUFF_KV.put("watches", JSON.stringify(watches));
+    await kvPut(env, "watches", JSON.stringify(watches));
     return Response.json({ ok: true });
   }
   if (path === "/admin/api/sub-add" || path === "/admin/api/sub-del") {
@@ -1387,7 +1407,7 @@ async function handleAdminApi(request, env, url) {
     } else {
       subs = subs.filter((s) => s.phone !== phone);
     }
-    await env.BUFF_KV.put("subscribers", JSON.stringify(subs));
+    await kvPut(env, "subscribers", JSON.stringify(subs));
     return Response.json({ ok: true });
   }
   return Response.json({ error: "unknown admin route" }, { status: 404 });
@@ -1402,7 +1422,7 @@ export default {
         const t0 = Date.now();
         // heartbeat FIRST (fire-and-forget): proves the cron fired and keeps the Render free-tier socket warm; awaiting it costs up to 10s of the tick budget
         fetch(env.BRIDGE_URL + "/status", { headers: { authorization: env.BRIDGE_SECRET }, signal: AbortSignal.timeout(10000) }).catch(() => {});
-        try { await env.BUFF_KV.put("last_poll", `${new Date().toISOString()} tick`); } catch (e) {}
+        try { await kvPut(env, "last_poll", `${new Date().toISOString()} tick`); } catch (e) {}
         // Shabbos release FIRST: window over + digest pending -> send the one rundown before the poll can eat the
         // tick's time budget. pending flag deleted only AFTER a successful send, so a killed tick retries next minute.
         try {
@@ -1415,13 +1435,13 @@ export default {
           const purged = new Date().getUTCMinutes() % 15 === 0 ? await purgeOldSent(env) : 0; // Plan B auto-clear, gated to every 15th tick - the sent: keyspace is big and per-tick purges were blowing the tick time budget
           const result = await poll(env, 6); // cap per-tick deliveries so the run stays inside the cron time budget; remainder flows next minute
           const done = `${new Date().toISOString()} ${result}${purged ? ` purged=${purged}` : ""} (${Date.now() - t0}ms)`;
-          await env.BUFF_KV.put("last_poll", done);
-          await env.BUFF_KV.put("last_done", done); // last_poll gets clobbered by the next tick's marker within the minute; last_done survives for health checks
+          await kvPut(env, "last_poll", done);
+          await kvPut(env, "last_done", done); // last_poll gets clobbered by the next tick's marker within the minute; last_done survives for health checks
         } catch (e) {
           try {
             const msg = `${new Date().toISOString()} ${e.message}`;
             const prev = await env.BUFF_KV.get("last_error");
-            if (!prev || prev.slice(24) !== msg.slice(24)) await env.BUFF_KV.put("last_error", msg);
+            if (!prev || prev.slice(24) !== msg.slice(24)) await kvPut(env, "last_error", msg);
           } catch (e2) {}
         }
       })()
@@ -1447,8 +1467,13 @@ export default {
       return Response.json({ ok: true, lastPoll, lastDone, lastError, paused: pausedF, waDown, subscribers: subs.length, filters, pendingAdds: pending, mode: await getMode(env) });
     }
     if (url.pathname === "/poll-now" && [env.VERIFY_TOKEN, env.BRIDGE_SECRET].includes(url.searchParams.get("key"))) {
-      const result = await poll(env);
-      return Response.json({ result });
+      const diag = url.searchParams.get("diag") ? {} : null;
+      try {
+        const result = await poll(env, undefined, diag);
+        return Response.json(diag ? { result, diag } : { result });
+      } catch (e) {
+        return Response.json({ error: String(e && e.message || e), diag }, { status: 500 });
+      }
     }
     return new Response("buff", { status: 200 });
   }
