@@ -580,6 +580,7 @@ async function poll(env, maxDeliver) {
   const shabbos = await shabbosHoldActive(env);
   if (shabbos) { try { if (!(await env.BUFF_KV.get("shabbos_digest_pending"))) await env.BUFF_KV.put("shabbos_digest_pending", String(Date.now())); } catch (e) {} }
   let held = 0;
+  let shabbosProcessed = 0; // per-tick processing cap during the hold (see break below)
   const heldItems = []; // batched into shabbos_items at tick end (survives the whole window, unlike 400-cap feed_items)
 
   // pending adds: confirm once a staged account actually shows up in the list timeline
@@ -610,7 +611,7 @@ async function poll(env, maxDeliver) {
         if (!passesFilters(t, filters)) continue;
         if ((await env.BUFF_KV.get(`gem:${id}`)) !== null) continue;
         candidates.push(t);
-        if (candidates.length >= (shabbos ? 40 : 10)) break; // during hold there's no delivery race - classify deeper so bursts don't leak unfiltered into the digest buffer
+        if (candidates.length >= (shabbos ? 15 : 10)) break; // during the hold, classify only what this tick will process (cap below) - keeps tick wall-time bounded
       }
       if (candidates.length) {
         const verdicts = await geminiClassify(env, gemKey, rules, feedMode, candidates, await getAcctRules(env));
@@ -654,12 +655,13 @@ async function poll(env, maxDeliver) {
       try {
         const hfp = storyFp([t.text, t.origText, t.quotedText].filter(Boolean).join(" "));
         const hasMedia = (t.media || []).length > 0; // new photos/videos/angles of an event are NOT dupes (2026-09-04 Ezra); identical media is already caught by media memory
-        if (!hasMedia && isStoryDupeFp(hfp, stories)) { await env.BUFF_KV.put(`seen:${t.id}`, "1", { expirationTtl: 14 * 86400 }); storyDupes++; continue; }
+        if (!hasMedia && isStoryDupeFp(hfp, stories)) { await env.BUFF_KV.put(`seen:${t.id}`, "1", { expirationTtl: 14 * 86400 }); storyDupes++; if (++shabbosProcessed >= 15) break; continue; }
         if (hfp.u.size) stories.push({ u: [...hfp.u].slice(0, 60), e: [...hfp.e].slice(0, 40), at: Date.now() });
       } catch (e) {}
       await env.BUFF_KV.put(`seen:${t.id}`, "1", { expirationTtl: 14 * 86400 });
       heldItems.push(retained[retained.length - 1]);
       held++;
+      if (++shabbosProcessed >= 15) break; // bound tick wall-time during the hold; the rest stay unseen for the next tick
       continue;
     }
     if (maxDeliver && delivered >= maxDeliver) break; // leave the rest unseen for the next tick
@@ -1389,10 +1391,20 @@ export default {
         // heartbeat FIRST: proves the cron fired and keeps the Render free-tier socket warm even if the poll below is killed mid-run
         try { await fetch(env.BRIDGE_URL + "/status", { headers: { authorization: env.BRIDGE_SECRET }, signal: AbortSignal.timeout(10000) }); } catch (e) {}
         try { await env.BUFF_KV.put("last_poll", `${new Date().toISOString()} tick`); } catch (e) {}
+        // Shabbos release FIRST: window over + digest pending -> send the one rundown before the poll can eat the
+        // tick's time budget. pending flag deleted only AFTER a successful send, so a killed tick retries next minute.
+        try {
+          if (!(await shabbosHoldActive(env)) && (await env.BUFF_KV.get("shabbos_digest_pending"))) {
+            await sendShabbosDigest(env);
+            await env.BUFF_KV.delete("shabbos_digest_pending");
+          }
+        } catch (e) {}
         try {
           const purged = await purgeOldSent(env); // Plan B auto-clear: delete the bot's own feed messages older than 24h
           const result = await poll(env, 6); // cap per-tick deliveries so the run stays inside the cron time budget; remainder flows next minute
-          await env.BUFF_KV.put("last_poll", `${new Date().toISOString()} ${result}${purged ? ` purged=${purged}` : ""} (${Date.now() - t0}ms)`);
+          const done = `${new Date().toISOString()} ${result}${purged ? ` purged=${purged}` : ""} (${Date.now() - t0}ms)`;
+          await env.BUFF_KV.put("last_poll", done);
+          await env.BUFF_KV.put("last_done", done); // last_poll gets clobbered by the next tick's marker within the minute; last_done survives for health checks
         } catch (e) {
           try {
             const msg = `${new Date().toISOString()} ${e.message}`;
@@ -1400,13 +1412,6 @@ export default {
             if (!prev || prev.slice(24) !== msg.slice(24)) await env.BUFF_KV.put("last_error", msg);
           } catch (e2) {}
         }
-        // Shabbos release: window over + digest pending -> send the one rundown, then live delivery resumes
-        try {
-          if (!(await shabbosHoldActive(env)) && (await env.BUFF_KV.get("shabbos_digest_pending"))) {
-            await env.BUFF_KV.delete("shabbos_digest_pending");
-            await sendShabbosDigest(env);
-          }
-        } catch (e) {}
       })()
     );
   },
@@ -1418,6 +1423,7 @@ export default {
     if (url.pathname === "/incoming" && request.method === "POST") return handleIncoming(request, env);
     if (url.pathname === "/health") {
       const lastPoll = await env.BUFF_KV.get("last_poll");
+      const lastDone = await env.BUFF_KV.get("last_done");
       const lastError = await env.BUFF_KV.get("last_error");
       const pausedF = !!(await env.BUFF_KV.get("feed_paused"));
       const waDown = !!(await env.BUFF_KV.get("wa_down"));
@@ -1426,7 +1432,7 @@ export default {
   const watches = await getWatches(env);
   const retained = []; // pushed into feed_items at the end (one batched write)
       const pending = await getPendingAdds(env);
-      return Response.json({ ok: true, lastPoll, lastError, paused: pausedF, waDown, subscribers: subs.length, filters, pendingAdds: pending, mode: await getMode(env) });
+      return Response.json({ ok: true, lastPoll, lastDone, lastError, paused: pausedF, waDown, subscribers: subs.length, filters, pendingAdds: pending, mode: await getMode(env) });
     }
     if (url.pathname === "/poll-now" && [env.VERIFY_TOKEN, env.BRIDGE_SECRET].includes(url.searchParams.get("key"))) {
       const result = await poll(env);
