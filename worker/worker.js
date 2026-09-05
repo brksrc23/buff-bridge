@@ -497,6 +497,7 @@ async function deliverTweet(env, t) {
 // Fail-soft KV write: when the free-tier daily write budget is exhausted, puts throw - skip writes for 5 min
 // instead of dying mid-tick, so polling/classification/digest continue (state just doesn't persist until reset).
 let KV_DEAD_UNTIL = 0;
+const RECENT_CLASSIFIED = new Set(); // isolate-local: backs up the gem:<id> KV cache while writes are degraded
 async function kvPut(env, key, value, opts) {
   if (Date.now() < KV_DEAD_UNTIL) return false;
   try { await env.BUFF_KV.put(key, value, opts); return true; }
@@ -629,6 +630,7 @@ async function poll(env, maxDeliver, diag) {
         if (!t) continue;
         if (t.replyToUserId && t.authorId && t.replyToUserId !== t.authorId) continue;
         if (!passesFilters(t, filters)) continue;
+        if (RECENT_CLASSIFIED.has(t.id)) continue;
         pre.push(t);
         if (pre.length >= cap * 2) break;
       }
@@ -644,7 +646,11 @@ async function poll(env, maxDeliver, diag) {
       if (candidates.length) {
         const verdicts = await geminiClassify(env, gemKey, rules, feedMode, candidates, await getAcctRules(env));
         mark("tClassify");
-        for (const [vid, gv] of verdicts) await kvPut(env, `gem:${vid}`, JSON.stringify(gv), { expirationTtl: 14 * 86400 });
+        for (const [vid, gv] of verdicts) {
+          await kvPut(env, `gem:${vid}`, JSON.stringify(gv), { expirationTtl: 14 * 86400 });
+          RECENT_CLASSIFIED.add(vid);
+          if (RECENT_CLASSIFIED.size > 1000) RECENT_CLASSIFIED.delete(RECENT_CLASSIFIED.values().next().value);
+        }
       }
     }
   }
@@ -1422,7 +1428,8 @@ export default {
         const t0 = Date.now();
         // heartbeat FIRST (fire-and-forget): proves the cron fired and keeps the Render free-tier socket warm; awaiting it costs up to 10s of the tick budget
         fetch(env.BRIDGE_URL + "/status", { headers: { authorization: env.BRIDGE_SECRET }, signal: AbortSignal.timeout(10000) }).catch(() => {});
-        try { await kvPut(env, "last_poll", `${new Date().toISOString()} tick`); } catch (e) {}
+        const healthTick = new Date().getUTCMinutes() % 5 === 0; // while the KV write budget is constrained, health markers get written every 5th tick only
+        if (healthTick) await kvPut(env, "last_poll", `${new Date().toISOString()} tick`);
         // Shabbos release FIRST: window over + digest pending -> send the one rundown before the poll can eat the
         // tick's time budget. pending flag deleted only AFTER a successful send, so a killed tick retries next minute.
         try {
@@ -1435,8 +1442,7 @@ export default {
           const purged = new Date().getUTCMinutes() % 15 === 0 ? await purgeOldSent(env) : 0; // Plan B auto-clear, gated to every 15th tick - the sent: keyspace is big and per-tick purges were blowing the tick time budget
           const result = await poll(env, 6); // cap per-tick deliveries so the run stays inside the cron time budget; remainder flows next minute
           const done = `${new Date().toISOString()} ${result}${purged ? ` purged=${purged}` : ""} (${Date.now() - t0}ms)`;
-          await kvPut(env, "last_poll", done);
-          await kvPut(env, "last_done", done); // last_poll gets clobbered by the next tick's marker within the minute; last_done survives for health checks
+          if (healthTick) { await kvPut(env, "last_poll", done); await kvPut(env, "last_done", done); } // every 5th tick - see healthTick above
         } catch (e) {
           try {
             const msg = `${new Date().toISOString()} ${e.message}`;
