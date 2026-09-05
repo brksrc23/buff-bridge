@@ -390,9 +390,12 @@ async function purgeOldSent(env) {
     const cutoff = Date.now() - 24 * 3600 * 1000;
     const list = await env.BUFF_KV.list({ prefix: "sent:" });
     let purged = 0;
-    for (const k of list.keys) {
-      const at = Number(await env.BUFF_KV.get(k.name));
+    const names = list.keys.map((k) => k.name).slice(0, 80); // bound per run; the rest are caught by the next gated run
+    const vals = await Promise.all(names.map((n) => env.BUFF_KV.get(n))); // parallel: sequential gets were adding 25-40s per tick
+    for (let i = 0; i < names.length; i++) {
+      const at = Number(vals[i]);
       if (!at || at > cutoff) continue;
+      const k = { name: names[i] };
       const [, to, id] = k.name.split(":");
       const ok = await bridgeDelete(env, id, to).catch(() => false);
       if (ok) { await env.BUFF_KV.delete(k.name); purged++; }
@@ -555,16 +558,16 @@ async function poll(env, maxDeliver) {
   const paused = !!(await env.BUFF_KV.get("feed_paused"));
   const waDown = await env.BUFF_KV.get("wa_down");
 
+  const seenFlags = await Promise.all(ids.map((id) => env.BUFF_KV.get(`seen:${id}`))); // parallel: sequential scans were eating the tick budget
   const unseen = [];
-  let skipped = 0, checked = 0;
-  for (const id of ids) {
-    checked++;
-    if (await env.BUFF_KV.get(`seen:${id}`)) {
+  let skipped = 0;
+  for (let i = 0; i < ids.length; i++) {
+    if (seenFlags[i]) {
       skipped++;
-      if (checked >= 5) break;
+      if (i + 1 >= 5) break; // same early-stop as before: first seen item at position >=5 ends the scan
       continue;
     }
-    unseen.push(id);
+    unseen.push(ids[i]);
   }
 
   if (!unseen.length) return `delivered=0 dropped=0 skipped=${skipped} filtered=0 deferred=0${paused ? " paused" : ""}${waDown ? " wa_down" : ""} scan-quiet`;
@@ -603,15 +606,22 @@ async function poll(env, maxDeliver) {
     const gemKey = await getGeminiKey(env);
     if (gemKey) {
       const rules = await getRules(env);
-      const candidates = [];
+      const cap = shabbos ? 15 : 10; // during the hold, classify only what this tick will process - keeps tick wall-time bounded
+      const pre = [];
       for (const id of [...unseen].reverse()) {
         const t = byId.get(id);
         if (!t) continue;
         if (t.replyToUserId && t.authorId && t.replyToUserId !== t.authorId) continue;
         if (!passesFilters(t, filters)) continue;
-        if ((await env.BUFF_KV.get(`gem:${id}`)) !== null) continue;
-        candidates.push(t);
-        if (candidates.length >= (shabbos ? 15 : 10)) break; // during the hold, classify only what this tick will process (cap below) - keeps tick wall-time bounded
+        pre.push(t);
+        if (pre.length >= cap * 2) break;
+      }
+      const gemFlags = await Promise.all(pre.map((t) => env.BUFF_KV.get(`gem:${t.id}`))); // parallel
+      const candidates = [];
+      for (let i = 0; i < pre.length; i++) {
+        if (gemFlags[i] !== null) continue;
+        candidates.push(pre[i]);
+        if (candidates.length >= cap) break;
       }
       if (candidates.length) {
         const verdicts = await geminiClassify(env, gemKey, rules, feedMode, candidates, await getAcctRules(env));
@@ -619,7 +629,9 @@ async function poll(env, maxDeliver) {
       }
     }
   }
+  let looped = 0;
   for (const id of [...unseen].reverse()) { // oldest-first
+    if (shabbos && ++looped > 30) break; // bound total per-tick work during the hold; remainder stays unseen for next tick
     const t = byId.get(id);
     if (!t) continue;
     // reply filter: drop replies to OTHER users; keep originals + self-thread continuations
@@ -1388,8 +1400,8 @@ export default {
     ctx.waitUntil(
       (async () => {
         const t0 = Date.now();
-        // heartbeat FIRST: proves the cron fired and keeps the Render free-tier socket warm even if the poll below is killed mid-run
-        try { await fetch(env.BRIDGE_URL + "/status", { headers: { authorization: env.BRIDGE_SECRET }, signal: AbortSignal.timeout(10000) }); } catch (e) {}
+        // heartbeat FIRST (fire-and-forget): proves the cron fired and keeps the Render free-tier socket warm; awaiting it costs up to 10s of the tick budget
+        fetch(env.BRIDGE_URL + "/status", { headers: { authorization: env.BRIDGE_SECRET }, signal: AbortSignal.timeout(10000) }).catch(() => {});
         try { await env.BUFF_KV.put("last_poll", `${new Date().toISOString()} tick`); } catch (e) {}
         // Shabbos release FIRST: window over + digest pending -> send the one rundown before the poll can eat the
         // tick's time budget. pending flag deleted only AFTER a successful send, so a killed tick retries next minute.
@@ -1400,7 +1412,7 @@ export default {
           }
         } catch (e) {}
         try {
-          const purged = await purgeOldSent(env); // Plan B auto-clear: delete the bot's own feed messages older than 24h
+          const purged = new Date().getUTCMinutes() % 15 === 0 ? await purgeOldSent(env) : 0; // Plan B auto-clear, gated to every 15th tick - the sent: keyspace is big and per-tick purges were blowing the tick time budget
           const result = await poll(env, 6); // cap per-tick deliveries so the run stays inside the cron time budget; remainder flows next minute
           const done = `${new Date().toISOString()} ${result}${purged ? ` purged=${purged}` : ""} (${Date.now() - t0}ms)`;
           await env.BUFF_KV.put("last_poll", done);
