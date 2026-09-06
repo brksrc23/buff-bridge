@@ -559,7 +559,7 @@ async function loadBS(env) {
   if (BS_CACHE) return BS_CACHE;
   let d = null;
   try { d = JSON.parse((await env.BUFF_KV.get(BS_KEY)) || "null"); } catch (e) {}
-  if (!d || d.v !== 1) d = { v: 1, born: 0, seen: [], gem: {}, media: {}, sent: [], stories: [], vol: null, gemCalls: null, lastPoll: null, lastDone: null, savedAt: 0 };
+  if (!d || d.v !== 1) d = { v: 1, born: 0, seen: [], gem: {}, media: {}, sent: [], stories: [], vol: null, gemCalls: null, lastPoll: null, lastDone: null, savedAt: 0, recentDel: [] };
   d.dirty = false;
   d.seenSet = new Set(d.seen);
   BS_CACHE = d;
@@ -762,7 +762,7 @@ async function poll(env, maxDeliver, diag) {
       if (d) d.candidates = candidates.length;
       mark("tPreClassify");
       if (candidates.length) {
-        const verdicts = await geminiClassify(env, gemKey, rules, feedMode, candidates, await getAcctRules(env));
+        const verdicts = await geminiClassify(env, gemKey, rules, feedMode, candidates, await getAcctRules(env), (bs.recentDel || []).map((x) => x.t));
         mark("tClassify");
         for (const [vid, gv] of verdicts) bsGemSet(bs, vid, gv);
       }
@@ -851,6 +851,12 @@ async function poll(env, maxDeliver, diag) {
       }
       bsSeenAdd(bs, id); // mark seen only AFTER successful send
       delivered++;
+      try { // rolling "already delivered" memory for the gatekeeper (restatement-drop context)
+        bs.recentDel = bs.recentDel || [];
+        bs.recentDel.push({ t: String(t.text || t.origText || "").replace(/\s+/g, " ").slice(0, 140), at: Date.now() });
+        bs.recentDel = bs.recentDel.filter((x) => Date.now() - x.at < 6 * 3600 * 1000).slice(-40);
+        bs.dirty = true;
+      } catch (e) {}
       await sleep(250);
     } catch (e) {
       if (e.bridgeDown) {
@@ -1112,7 +1118,7 @@ function parseGem(v) {
   try { const j = JSON.parse(v); return j && typeof j.d === "boolean" ? j : null; } catch (e) { return null; }
 }
 
-async function geminiClassify(env, key, rules, mode, tweets, acctRules) {
+async function geminiClassify(env, key, rules, mode, tweets, acctRules, recent) {
   const verdicts = new Map(tweets.map((t) => [t.id, { d: true }]));
   try {
     const ar = acctRules || {};
@@ -1130,6 +1136,7 @@ async function geminiClassify(env, key, rules, mode, tweets, acctRules) {
       "You are the gatekeeper for one user's X-to-WhatsApp news feed. Decide for each post if it is DELIVERED to their phone.\n" +
       "Standing rules:\n- " + rules.join("\n- ") + "\nWhen a post has accountRule, apply it to that post in addition to the standing rules.\n" +
       (mode === "breaking" ? "MODE: BREAKING NEWS ONLY. Deliver only urgent breaking news and on-the-ground event footage; drop everything else, even posts a looser filter would keep.\n" : "MODE: CUSTOM. Judge every post against the standing rules.\n") +
+      (recent && recent.length ? "ALREADY DELIVERED to the user in the last few hours (each line = one delivered post):\n- " + recent.slice(-40).join("\n- ") + "\nDrop any post that restates facts already delivered above unless it carries MATERIALLY NEW information (new casualty toll, official finding, genuinely new footage/angle, new location or development). A different outlet repeating the same facts is a DROP.\n" : "") +
       "Posts:\n" + JSON.stringify(brief) + "\n" +
       "Reply with ONLY a JSON array like [{\"id\":\"...\",\"deliver\":true,\"reason\":\"one short line\"}] covering every post id. Reason: max 12 words, plain. No other prose.";
     const res = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
