@@ -12,6 +12,7 @@ import * as Baileys from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-terminal';
 import QRCode from 'qrcode';
 import { restoreAuthFromKV, startMirroring, flushNow, kvStatus, clearKVSnapshot } from './kv-auth-store.js';
+import { initDedup, checkMedia, dedupStatus } from './media-dedup.js';
 
 const makeWASocket = Baileys.default?.default || Baileys.default;
 const { useMultiFileAuthState, makeCacheableSignalKeyStore, DisconnectReason, Browsers } = Baileys;
@@ -302,7 +303,7 @@ const server = http.createServer(async (req, res) => {
       connected, registered,
       pairingCode: registered ? null : lastPairingCode, pairingAt: lastPairingAt,
       qrAvailable: !registered && !!lastQR, qrAt: lastQRAt,
-      kv: kvStatus(), user: sock?.user?.id || null,
+      kv: kvStatus(), dedup: dedupStatus(), user: sock?.user?.id || null,
       bandwidth: { day: stats.day, bytesDay: stats.bytesDay, msgsDay: stats.msgsDay,
                    month: stats.month, bytesMonth: stats.bytesMonth, msgsMonth: stats.msgsMonth,
                    estMBMonth: +(stats.bytesMonth / 1e6).toFixed(1), note: 'estimate: media upload size + text + 1KB/msg overhead; KV flush bytes in kv.flushedBytesTotal; authoritative figure is Render dashboard > Billing' }
@@ -349,6 +350,15 @@ const server = http.createServer(async (req, res) => {
     const now = Date.now();
     for (const [k, t] of recentSends) if (now - t > 15 * 60 * 1000) recentSends.delete(k);
     if (recentSends.has(fp)) return reply(200, { id: null, dupe: true });
+    // perceptual media dedup: same-looking photo/footage from a different account
+    // delivers once per 14 days. If ALL media on the post is a perceptual dupe,
+    // the whole post is suppressed (not delivered text-only) - per Ezra 9/6.
+    if (payload.imageUrl || payload.videoUrl) {
+      try {
+        const d = await checkMedia(payload);
+        if (d.dupe) { recentSends.set(fp, now); return reply(200, { id: null, suppressed: 'media-dupe', dist: d.dist }); }
+      } catch (e) { console.error('[dedup] gate error (fail-open):', e.message); }
+    }
     recentSends.set(fp, now);
     try {
       const id = await sendToRecipient(payload);
@@ -364,4 +374,5 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`buff-bridge listening on http://${HOST}:${PORT} - recipient ${RECIPIENT}`);
 });
+await initDedup();
 await start();
