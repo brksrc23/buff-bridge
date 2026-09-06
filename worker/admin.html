@@ -71,6 +71,15 @@
   </div>
 
   <div class="card modes">
+    <h2>Shabbos</h2>
+    <div class="row">
+      <button data-smode="off" onclick="setShabbosMode('off')">Fully off</button>
+      <button data-smode="digest" onclick="setShabbosMode('digest')">Silent collect + rundown</button>
+    </div>
+    <div class="hint" id="smodeHint"></div>
+  </div>
+
+  <div class="card modes">
     <h2>Mode</h2>
     <div class="row">
       <button data-mode="everything" onclick="setMode('everything')">Everything</button>
@@ -101,8 +110,8 @@
     <div style="height:8px"></div>
     <div class="row">
       <button class="btn" onclick="saveRules()">Save rules</button>
-      <input type="password" id="gemKey" placeholder="Gemini API key (set or update)" style="flex:1">
-      <button class="btn ghost" onclick="saveGemKey()">Save key</button>
+      <input type="password" id="gemKey" placeholder="Gemini API key - one-time install, stored as a Cloudflare secret" style="flex:1">
+      <button class="btn ghost" onclick="saveGemKey()">Install key</button>
     </div>
   </div>
 
@@ -177,6 +186,8 @@ async function load() {
   pt.classList.toggle('on', !s.paused);
   document.getElementById('pauseLabel').innerHTML = s.paused ? '<b class="bad">PAUSED</b> - tap to resume' : '<b class="ok">RUNNING</b> - tap to pause';
   document.querySelectorAll('.modes button').forEach(b => b.classList.toggle('active', b.dataset.mode === s.mode));
+  document.querySelectorAll('[data-smode]').forEach(b => b.classList.toggle('active', b.dataset.smode === (s.shabbosMode || 'off')));
+  document.getElementById('smodeHint').textContent = (s.shabbosMode === 'digest') ? 'Collects silently during Shabbos, then sends one sectioned rundown after havdalah.' : 'Fully dark from candle-lighting to havdalah - no collecting, nothing sent. Resumes live after.';
   document.getElementById('modeHint').textContent =
     s.mode === 'everything' ? 'Everything delivers (muted/link-only filters still apply). Gemini is bypassed.' :
     s.mode === 'breaking' ? 'Gemini passes only breaking news and event footage, plus your always-deliver rules.' :
@@ -224,6 +235,7 @@ async function changeKey() {
   if (res.ok && j.ok) { KEY = document.getElementById('newKey').value; localStorage.setItem('buff_admin_key', KEY); msg.textContent = 'Key changed - you are now using the new key.'; }
   else msg.textContent = j.error || 'Failed.';
 }
+async function setShabbosMode(m) { await api('/shabbos-mode', { mode: m }); load(); }
 async function setPower() { const s = await api('/state'); const on = s.power === 'off'; if (!confirm(on ? 'Turn the bot ON? It resumes from now, no catch-up.' : 'Turn the bot fully OFF? Polling stops and the WhatsApp link suspends.')) return; const r = await api('/power', { on }); if (!r.ok) alert('Power switch had a problem: ' + JSON.stringify(r.steps)); load(); }
 if (KEY) load(); else showLogin();
 </script>
