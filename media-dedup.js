@@ -71,7 +71,7 @@ function runFFmpeg(args, inputBuf) {
     p.on('close', (code) => resolve({ code, stdout: Buffer.concat(out), stderr: Buffer.concat(err).toString() }));
     if (inputBuf) p.stdin.write(inputBuf);
     p.stdin.end();
-    setTimeout(() => { try { p.kill('SIGKILL'); } catch {} reject(new Error('ffmpeg timeout')); }, 45000);
+    setTimeout(() => { try { p.kill('SIGKILL'); } catch {} reject(new Error('ffmpeg timeout')); }, 30000);
   });
 }
 
@@ -81,7 +81,7 @@ async function videoHashes(buf) {
   const tmp = path.join(os.tmpdir(), 'dedup-' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.mp4');
   try {
     fs.writeFileSync(tmp, buf);
-    const probe = await runFFmpeg(['-i', tmp, '-f', 'null', '-']);
+    const probe = await runFFmpeg(['-i', tmp]); // metadata only: no output args = instant parse, no full decode
     const m = /Duration: (\d+):(\d+):([\d.]+)/.exec(probe.stderr);
     const dur = m ? (+m[1] * 3600 + +m[2] * 60 + +m[3]) : 0;
     const ats = dur > 2 ? [dur * 0.15, dur * 0.5, dur * 0.85] : [0.5, 1.5, 3];
