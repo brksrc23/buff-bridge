@@ -362,10 +362,7 @@ async function deliverToAll(env, payload) {
   let firstId = null;
   for (const to of targets) {
     const id = await bridgeSend(env, payload, to);
-    if (id) {
-      // Plan B auto-clear: log every feed message so the poll loop can delete it for everyone after 24h
-      try { await kvPut(env, `sent:${to}:${id}`, String(Date.now()), { expirationTtl: 26 * 3600 }); } catch (e) {}
-    }
+    if (id) bsSentAdd(await loadBS(env), to, id); // Plan B auto-clear: blob-logged, purged 24h later by bsPurgeSent
     if (!firstId) firstId = id;
     await sleep(250);
   }
@@ -481,9 +478,9 @@ async function deliverTweet(env, t) {
   for (const m of t.media) {
     const fp = dedupOff ? null : await mediaFingerprint(m);
     if (fp) {
-      const dupe = await env.BUFF_KV.get(`media:${fp}`);
-      if (dupe) { suppressed++; continue; } // exact media already sent (boilerplate logos, cross-account re-uploads) - suppress, text+link still goes
-      await kvPut(env, `media:${fp}`, t.id, { expirationTtl: 14 * 86400 });
+      const bsM = await loadBS(env);
+      if (bsMediaHas(bsM, fp)) { suppressed++; continue; } // exact media already sent (boilerplate logos, cross-account re-uploads) - suppress, text+link still goes
+      bsMediaSet(bsM, fp);
     }
     await deliverToAll(env, m.kind === "image" ? { imageUrl: m.url } : { videoUrl: m.url });
     await sleep(250);
@@ -507,6 +504,71 @@ async function kvPut(env, key, value, opts) {
 async function getJSON(env, key, fallback) {
   try { const v = await env.BUFF_KV.get(key); return v ? JSON.parse(v) : fallback; } catch (e) { return fallback; }
 }
+
+// ---------- v29: consolidated state blob - one KV read per tick, at most one throttled write ----------
+// Replaces the per-item seen:/gem:/media:/sent: keys that were burning the free-tier daily read+write budgets.
+const BS_KEY = "bs_v1";
+const BS_SAVE_MIN_MS = 120000; // cross-isolate throttle: one blob write per 2 min unless forced
+let BS_CACHE = null; // isolate-local
+let RETAINED_PENDING = []; // feed_items backlog between 5-min flushes
+let FEED_LAST_WRITE = 0;
+async function loadBS(env) {
+  if (BS_CACHE) return BS_CACHE;
+  let d = null;
+  try { d = JSON.parse((await env.BUFF_KV.get(BS_KEY)) || "null"); } catch (e) {}
+  if (!d || d.v !== 1) d = { v: 1, born: 0, seen: [], gem: {}, media: {}, sent: [], stories: [], vol: null, gemCalls: null, lastPoll: null, lastDone: null, savedAt: 0 };
+  d.dirty = false;
+  d.seenSet = new Set(d.seen);
+  BS_CACHE = d;
+  return d;
+}
+async function saveBS(env, bs, force) {
+  if (!bs.dirty && !force) return false;
+  if (!force && Date.now() - (bs.savedAt || 0) < BS_SAVE_MIN_MS) return false;
+  bs.savedAt = Date.now();
+  const out = { ...bs };
+  delete out.dirty; delete out.seenSet;
+  const ok = await kvPut(env, BS_KEY, JSON.stringify(out));
+  if (ok) bs.dirty = false;
+  return ok;
+}
+function bsSeenHas(bs, id) { return bs.seenSet.has(id); }
+function bsSeenAdd(bs, id) {
+  if (bs.seenSet.has(id)) return;
+  bs.seen.push(id); bs.seenSet.add(id); bs.dirty = true;
+  if (bs.seen.length > 1500) { bs.seen = bs.seen.slice(-1500); bs.seenSet = new Set(bs.seen); }
+}
+function bsGemGet(bs, id) { return bs.gem[id] || null; }
+function bsGemSet(bs, id, gv) {
+  bs.gem[id] = { d: gv.d, r: gv.r, at: Date.now() }; bs.dirty = true;
+  const ks = Object.keys(bs.gem);
+  if (ks.length > 600) { ks.sort((a, b) => bs.gem[a].at - bs.gem[b].at); for (const k of ks.slice(0, ks.length - 600)) delete bs.gem[k]; }
+}
+function bsMediaHas(bs, fp) { return !!bs.media[fp]; }
+function bsMediaSet(bs, fp) {
+  bs.media[fp] = Date.now(); bs.dirty = true;
+  const ks = Object.keys(bs.media);
+  if (ks.length > 600) { ks.sort((a, b) => bs.media[a] - bs.media[b]); for (const k of ks.slice(0, ks.length - 600)) delete bs.media[k]; }
+}
+function bsSentAdd(bs, to, id) {
+  bs.sent.push({ to, id, at: Date.now() }); bs.dirty = true;
+  if (bs.sent.length > 400) bs.sent = bs.sent.slice(-400);
+}
+// Plan B 24h auto-clear from the blob - no more sent: keyspace scans
+async function bsPurgeSent(env, bs) {
+  try {
+    const cutoff = Date.now() - 24 * 3600 * 1000;
+    let purged = 0;
+    const old = bs.sent.filter((s) => s.at < cutoff).slice(0, 20); // bounded per run
+    for (const s of old) {
+      const ok = await bridgeDelete(env, s.id, s.to).catch(() => false);
+      if (ok) { bs.sent = bs.sent.filter((x) => x !== s); bs.dirty = true; purged++; }
+      await sleep(200);
+    }
+    return purged;
+  } catch (e) { return 0; }
+}
+const snowMs = (id) => Number((BigInt(id) >> 22n) + 1288834974657n); // tweet id -> post time
 const getFilters = (env) => getJSON(env, "filters_v1", { muted: [], linkOnly: [], drop: {} }); // linkOnly: ["*"] or handles; drop: {links,video,image,gif} global content-type switches
 const getPendingAdds = (env) => getJSON(env, "pending_adds", []);
 
@@ -562,21 +624,22 @@ async function poll(env, maxDeliver, diag) {
   const ids = [...new Set([...raw.matchAll(/"entryId":"tweet-(\d+)"/g)].map((m) => m[1]))];
   if (!ids.length) return "timeline empty";
 
-  const seeded = await env.BUFF_KV.get("seeded");
-  if (!seeded) {
-    for (const id of ids) await kvPut(env, `seen:${id}`, "1", { expirationTtl: 14 * 86400 });
-    await kvPut(env, "seeded", "1");
-    return `seeded ${ids.length} tweets, delivered none`;
+  const bs = await loadBS(env);
+  if (!bs.born) {
+    // v29 bootstrap: fresh state blob - mark the whole current timeline seen, deliver nothing (resume from NOW, never a backlog dump)
+    bs.born = Date.now();
+    for (const id of ids) bsSeenAdd(bs, id);
+    await saveBS(env, bs, true);
+    return `v29 bootstrap: seeded ${ids.length} timeline ids into the state blob, delivered none`;
   }
 
   const paused = !!(await env.BUFF_KV.get("feed_paused"));
   const waDown = await env.BUFF_KV.get("wa_down");
 
-  const seenFlags = await Promise.all(ids.map((id) => env.BUFF_KV.get(`seen:${id}`))); // parallel: sequential scans were eating the tick budget
   const unseen = [];
   let skipped = 0;
   for (let i = 0; i < ids.length; i++) {
-    if (seenFlags[i]) {
+    if (bsSeenHas(bs, ids[i])) {
       skipped++;
       if (i + 1 >= 5) break; // same early-stop as before: first seen item at position >=5 ends the scan
       continue;
@@ -595,10 +658,16 @@ async function poll(env, maxDeliver, diag) {
   const filters = await getFilters(env);
   const watches = await getWatches(env);
   const retained = []; // pushed into feed_items at the end (one batched write)
-  const stories = (await getJSON(env, STORIES_KEY, [])).filter((s) => Date.now() - s.at < 24 * 3600 * 1000); // delivered-story fingerprints, 24h window; tick-local appends make same-tick dupes deterministic
+  const stories = bs.stories.filter((s) => Date.now() - s.at < 24 * 3600 * 1000); // delivered-story fingerprints, 24h window, lives in the state blob; tick-local appends make same-tick dupes deterministic
   let storyDupes = 0;
   const shabbos = await shabbosHoldActive(env);
   if (shabbos) { try { if (!(await env.BUFF_KV.get("shabbos_digest_pending"))) await kvPut(env, "shabbos_digest_pending", String(Date.now())); } catch (e) {} }
+  // Post-window resume gate (full-off Shabbos mode): posts from inside the dark window are marked seen + kept for queries, never delivered
+  let resumeCutoff = 0;
+  try {
+    const win = await getShabbosWindow(env);
+    if (win && win.end) { const end = Date.parse(win.end); const ago = Date.now() - end; if (ago > 0 && ago < 3600000) resumeCutoff = end; }
+  } catch (e) {}
   let held = 0;
   let shabbosProcessed = 0; // per-tick processing cap during the hold (see break below)
   const heldItems = []; // batched into shabbos_items at tick end (survives the whole window, unlike 400-cap feed_items)
@@ -630,14 +699,12 @@ async function poll(env, maxDeliver, diag) {
         if (!t) continue;
         if (t.replyToUserId && t.authorId && t.replyToUserId !== t.authorId) continue;
         if (!passesFilters(t, filters)) continue;
-        if (RECENT_CLASSIFIED.has(t.id)) continue;
         pre.push(t);
         if (pre.length >= cap * 2) break;
       }
-      const gemFlags = await Promise.all(pre.map((t) => env.BUFF_KV.get(`gem:${t.id}`))); // parallel
       const candidates = [];
       for (let i = 0; i < pre.length; i++) {
-        if (gemFlags[i] !== null) continue;
+        if (bsGemGet(bs, pre[i].id) !== null) continue;
         candidates.push(pre[i]);
         if (candidates.length >= cap) break;
       }
@@ -646,11 +713,7 @@ async function poll(env, maxDeliver, diag) {
       if (candidates.length) {
         const verdicts = await geminiClassify(env, gemKey, rules, feedMode, candidates, await getAcctRules(env));
         mark("tClassify");
-        for (const [vid, gv] of verdicts) {
-          await kvPut(env, `gem:${vid}`, JSON.stringify(gv), { expirationTtl: 14 * 86400 });
-          RECENT_CLASSIFIED.add(vid);
-          if (RECENT_CLASSIFIED.size > 1000) RECENT_CLASSIFIED.delete(RECENT_CLASSIFIED.values().next().value);
-        }
+        for (const [vid, gv] of verdicts) bsGemSet(bs, vid, gv);
       }
     }
   }
@@ -659,30 +722,36 @@ async function poll(env, maxDeliver, diag) {
     if (shabbos && ++looped > 30) break; // bound total per-tick work during the hold; remainder stays unseen for next tick
     const t = byId.get(id);
     if (!t) continue;
+    if (resumeCutoff && snowMs(id) < resumeCutoff) { // posted inside the Shabbos full-off window: keep for queries, never deliver
+      retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), windowSkipped: true });
+      bsSeenAdd(bs, id);
+      skipped++;
+      continue;
+    }
     // reply filter: drop replies to OTHER users; keep originals + self-thread continuations
     if (t.replyToUserId && t.authorId && t.replyToUserId !== t.authorId) {
-      await kvPut(env, `seen:${id}`, "1", { expirationTtl: 14 * 86400 });
+      bsSeenAdd(bs, id);
       skipped++;
       continue;
     }
     if (!passesFilters(t, filters)) {
       retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now() });
-      await kvPut(env, `seen:${id}`, "1", { expirationTtl: 14 * 86400 });
+      bsSeenAdd(bs, id);
       filtered++;
       continue;
     }
     if (!holding && feedMode !== "everything") {
-      const gv = parseGem(await env.BUFF_KV.get(`gem:${id}`));
+      const gv = parseGem(bsGemGet(bs, id) ? JSON.stringify(bsGemGet(bs, id)) : null);
       if (gv && gv.d === false) { // gatekeeper dropped it: retain for queries, never deliver
         retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now() });
-        await kvPut(env, `seen:${id}`, "1", { expirationTtl: 14 * 86400 });
+        bsSeenAdd(bs, id);
         filtered++;
         continue;
       }
     }
     if (holding) {
       retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now() });
-      await kvPut(env, `seen:${id}`, "1", { expirationTtl: 14 * 86400 });
+      bsSeenAdd(bs, id);
       deferred++;
       continue;
     }
@@ -692,10 +761,10 @@ async function poll(env, maxDeliver, diag) {
       try {
         const hfp = storyFp([t.text, t.origText, t.quotedText].filter(Boolean).join(" "));
         const hasMedia = (t.media || []).length > 0; // new photos/videos/angles of an event are NOT dupes (2026-09-04 Ezra); identical media is already caught by media memory
-        if (!hasMedia && isStoryDupeFp(hfp, stories)) { await kvPut(env, `seen:${t.id}`, "1", { expirationTtl: 14 * 86400 }); storyDupes++; if (++shabbosProcessed >= 15) break; continue; }
+        if (!hasMedia && isStoryDupeFp(hfp, stories)) { bsSeenAdd(bs, t.id); storyDupes++; if (++shabbosProcessed >= 15) break; continue; }
         if (hfp.u.size) stories.push({ u: [...hfp.u].slice(0, 60), e: [...hfp.e].slice(0, 40), at: Date.now() });
       } catch (e) {}
-      await kvPut(env, `seen:${t.id}`, "1", { expirationTtl: 14 * 86400 });
+      bsSeenAdd(bs, t.id);
       heldItems.push(retained[retained.length - 1]);
       held++;
       if (++shabbosProcessed >= 15) break; // bound tick wall-time during the hold; the rest stay unseen for the next tick
@@ -709,7 +778,7 @@ async function poll(env, maxDeliver, diag) {
       const hasMedia = (t.media || []).length > 0; // new photos/videos/angles of an event are NOT dupes (2026-09-04 Ezra)
       if (!hasMedia && isStoryDupeFp(fp, stories)) {
           retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), storyDupe: true });
-          await kvPut(env, `seen:${t.id}`, "1", { expirationTtl: 14 * 86400 });
+          bsSeenAdd(bs, t.id);
           storyDupes++;
           continue;
       }
@@ -722,7 +791,7 @@ async function poll(env, maxDeliver, diag) {
       if (hit) {
         await bridgeSend(env, { text: `Watch hit for "${hit.phrase}": see the post above from ${t.name} (@${t.handle}).` }, String(env.ADMIN_PHONE).replace(/\D/g, "")).catch(() => {});
       }
-      await kvPut(env, `seen:${id}`, "1", { expirationTtl: 14 * 86400 }); // mark seen only AFTER successful send
+      bsSeenAdd(bs, id); // mark seen only AFTER successful send
       delivered++;
       await sleep(250);
     } catch (e) {
@@ -735,7 +804,7 @@ async function poll(env, maxDeliver, diag) {
       throw e;
     }
   }
-  try { await kvPut(env, STORIES_KEY, JSON.stringify(stories.slice(-120))); } catch (e) {}
+  bs.stories = stories.slice(-120); bs.dirty = true;
   if (heldItems.length) {
     try {
       const buf = await getJSON(env, "shabbos_items", []);
@@ -745,16 +814,20 @@ async function poll(env, maxDeliver, diag) {
   }
   mark("tLoop");
   if (retained.length) {
-    const items = await getFeedItems(env);
-    items.push(...retained);
-    await kvPut(env, FEED_ITEMS_KEY, JSON.stringify(items.slice(-FEED_ITEMS_MAX)));
-    // volume stats for the dashboard: one read-modify-write per poll, not per tweet
-    const vday = new Date().toISOString().slice(0, 10);
-    const vkey = `vol:${vday}`;
-    const vol = (await getJSON(env, vkey, null)) || { delivered: 0, suppressed: 0, filtered: 0, deferred: 0 };
-    vol.delivered += delivered; vol.suppressed += suppressed; vol.filtered += filtered; vol.deferred += deferred;
-    await kvPut(env, vkey, JSON.stringify(vol), { expirationTtl: 7 * 86400 });
+    RETAINED_PENDING.push(...retained);
+    if (RETAINED_PENDING.length > 800) RETAINED_PENDING = RETAINED_PENDING.slice(-800);
+    if (Date.now() - FEED_LAST_WRITE > 300000) { // feed_items (the "anything on X?" query store) flushes at most every 5 min
+      const items = await getFeedItems(env);
+      items.push(...RETAINED_PENDING);
+      if (await kvPut(env, FEED_ITEMS_KEY, JSON.stringify(items.slice(-FEED_ITEMS_MAX)))) { RETAINED_PENDING = []; FEED_LAST_WRITE = Date.now(); }
+    }
   }
+  // volume stats live in the state blob now
+  const vday = new Date().toISOString().slice(0, 10);
+  if (!bs.vol || bs.vol.day !== vday) bs.vol = { day: vday, delivered: 0, suppressed: 0, filtered: 0, deferred: 0 };
+  bs.vol.delivered += delivered; bs.vol.suppressed += suppressed; bs.vol.filtered += filtered; bs.vol.deferred += deferred;
+  if (delivered || suppressed || filtered || deferred) bs.dirty = true;
+  await saveBS(env, bs, delivered > 0); // force-persist on delivery ticks; otherwise the 2-min throttle governs
   return `delivered=${delivered} dropped=${dropped} skipped=${skipped} filtered=${filtered} deferred=${deferred} suppressed=${suppressed}${storyDupes ? ` storydupes=${storyDupes}` : ""}${held ? ` held=${held}` : ""}${shabbos ? " shabbos" : ""}${paused ? " paused" : ""}${waDown ? " wa_down" : ""}`;
 }
 
@@ -879,7 +952,7 @@ async function handleCommand(env, from, textRaw) {
     return reply(subs.length ? subs.map((s) => `+${s.phone}${s.paused ? " (paused)" : ""}`).join("\n") : "No subscribers yet.");
   }
   if (m === "status") {
-    const lastPoll = await env.BUFF_KV.get("last_poll");
+    const lastPoll = (await loadBS(env)).lastPoll;
     const lastError = await env.BUFF_KV.get("last_error");
     const pausedF = !!(await env.BUFF_KV.get("feed_paused"));
     const waDown = !!(await env.BUFF_KV.get("wa_down"));
@@ -1020,9 +1093,9 @@ async function geminiClassify(env, key, rules, mode, tweets, acctRules) {
     const arr = JSON.parse(txt.slice(start, end + 1));
     for (const v of arr) if (v && v.id && typeof v.deliver === "boolean") verdicts.set(String(v.id), { d: v.deliver, r: typeof v.reason === "string" ? v.reason.slice(0, 140) : undefined });
     const day = new Date().toISOString().slice(0, 10);
-    const ukey = `gem_usage:${day}`;
-    const used = parseInt((await env.BUFF_KV.get(ukey)) || "0", 10) + 1;
-    await kvPut(env, ukey, String(used), { expirationTtl: 3 * 86400 });
+    const bsU = await loadBS(env);
+    if (!bsU.gemCalls || bsU.gemCalls.day !== day) bsU.gemCalls = { day, n: 0 };
+    bsU.gemCalls.n++; bsU.dirty = true;
   } catch (e) { /* fail open */ }
   return verdicts;
 }
@@ -1050,7 +1123,7 @@ async function renderPower(env, action) { // "suspend" | "resume"
 }
 
 // ---------- admin dashboard ----------
-const ADMIN_HTML = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>BUFF Admin</title>\n<style>\n  :root { --bg:#0f1115; --card:#181c24; --line:#262c38; --txt:#e8eaf0; --dim:#8b93a5; --accent:#4da3ff; --green:#3ddc84; --red:#ff5c5c; }\n  * { box-sizing:border-box; }\n  body { margin:0; background:var(--bg); color:var(--txt); font:15px/1.45 -apple-system, system-ui, sans-serif; }\n  .wrap { max-width:860px; margin:0 auto; padding:16px; }\n  h1 { font-size:20px; margin:8px 0 2px; }\n  .sub { color:var(--dim); font-size:13px; margin-bottom:16px; }\n  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin-bottom:14px; }\n  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 10px; }\n  .row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }\n  .modes button, .pill { border:1px solid var(--line); background:#10141b; color:var(--txt); border-radius:999px; padding:8px 14px; cursor:pointer; font-size:14px; }\n  .modes button.active { background:var(--accent); border-color:var(--accent); color:#04101f; font-weight:600; }\n  .toggle { width:46px; height:26px; border-radius:999px; background:#2a3140; border:1px solid var(--line); position:relative; cursor:pointer; flex:none; }\n  .toggle::after { content:\"\"; position:absolute; top:2px; left:2px; width:20px; height:20px; border-radius:50%; background:#fff; transition:left .15s; }\n  .toggle.on { background:var(--green); }\n  .toggle.on::after { left:22px; }\n  table { width:100%; border-collapse:collapse; }\n  td, th { text-align:left; padding:7px 6px; border-bottom:1px solid var(--line); font-size:14px; }\n  th { color:var(--dim); font-size:12px; font-weight:600; }\n  .muted-h { color:var(--dim); }\n  input[type=text], input[type=password], textarea { width:100%; background:#10141b; border:1px solid var(--line); color:var(--txt); border-radius:8px; padding:9px 10px; font-size:14px; }\n  textarea { min-height:110px; font-family:inherit; }\n  .btn { background:var(--accent); color:#04101f; border:0; border-radius:8px; padding:9px 14px; font-weight:600; cursor:pointer; }\n  .btn.ghost { background:#10141b; color:var(--txt); border:1px solid var(--line); }\n  .btn.danger { background:transparent; color:var(--red); border:1px solid var(--red); padding:4px 10px; font-size:13px; }\n  .chip { display:inline-flex; align-items:center; gap:8px; background:#10141b; border:1px solid var(--line); border-radius:999px; padding:6px 12px; margin:3px 4px 3px 0; font-size:14px; }\n  .chip button { background:none; border:0; color:var(--red); cursor:pointer; font-size:15px; padding:0; }\n  .stat { display:flex; justify-content:space-between; padding:5px 0; font-size:14px; }\n  .stat span:last-child { color:var(--dim); }\n  .ok { color:var(--green); } .bad { color:var(--red); }\n  #login { max-width:380px; margin:18vh auto 0; }\n  .hint { color:var(--dim); font-size:12px; margin-top:6px; }\n  .hidden { display:none; }\n</style>\n</head>\n<body>\n<div id=\"login\" class=\"card\">\n  <h1>BUFF Admin</h1>\n  <p class=\"sub\">Enter the admin key to manage the feed.</p>\n  <input type=\"password\" id=\"key\" placeholder=\"Admin key\" autocomplete=\"off\">\n  <div style=\"height:10px\"></div>\n  <button class=\"btn\" onclick=\"saveKey()\">Open dashboard</button>\n  <div class=\"hint\" id=\"loginErr\"></div>\n</div>\n<div class=\"wrap hidden\" id=\"app\">\n  <h1>BUFF Admin</h1>\n  <div class=\"sub\">X feed to WhatsApp - live control</div>\n\n  <div class=\"card\">\n    <h2>Feed</h2>\n    <div class=\"row\">\n      <div class=\"toggle\" id=\"pauseToggle\" onclick=\"setPaused()\"></div>\n      <div id=\"pauseLabel\">...</div>\n    </div>\n    <div class=\"hint\">Paused = nothing sends, feed keeps collecting. Start = resume from now. Never a backlog dump.</div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Bot power</h2>\n    <div class=\"row\">\n      <button class=\"btn\" id=\"powerBtn\" onclick=\"setPower()\">...</button>\n      <span class=\"hint\" id=\"powerHint\"></span>\n    </div>\n    <div class=\"hint\">OFF = stops polling and suspends the WhatsApp link (full Shabbos mode). ON = resumes. No catch-up either way - it continues from the moment you switch.</div>\n  </div>\n\n  <div class=\"card modes\">\n    <h2>Mode</h2>\n    <div class=\"row\">\n      <button data-mode=\"everything\" onclick=\"setMode('everything')\">Everything</button>\n      <button data-mode=\"breaking\" onclick=\"setMode('breaking')\">Breaking news only</button>\n      <button data-mode=\"custom\" onclick=\"setMode('custom')\">Custom (rules)</button>\n    </div>\n    <div class=\"hint\" id=\"modeHint\"></div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Content filters</h2>\n    <table><tbody>\n      <tr><td>Drop bare article-link posts (all accounts)</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgLinks\" onclick=\"setDrop('links')\"></div></td></tr>\n      <tr><td>Drop posts with videos</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgVideo\" onclick=\"setDrop('video')\"></div></td></tr>\n      <tr><td>Drop posts with images</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgImage\" onclick=\"setDrop('image')\"></div></td></tr>\n      <tr><td>Drop posts with GIFs</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgGif\" onclick=\"setDrop('gif')\"></div></td></tr>\n      <tr><td>Media memory (skip media already sent)</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgDedup\" onclick=\"setDedup()\"></div></td></tr>\n    </tbody></table>\n    <div class=\"hint\">Logo/boilerplate media is handled by media memory - it stays on unless you switch it off here.</div>\n  </div>\n  <div class=\"hint\" style=\"margin:-4px 0 14px\">Account list is managed on X itself. To mute an account or drop its link-only posts without removing it, text the bot: <b>mute @handle</b>, <b>linkonly @handle</b>.</div>\n\n  <div class=\"card\">\n    <h2>Gatekeeper rules (Gemini)</h2>\n    <div class=\"hint\">One rule per line, plain English. Used in Breaking and Custom modes. Default: deliver breaking news AND major updates to ongoing stories; drop routine commentary, opinion, and link-only posts. If Gemini is unreachable, posts deliver anyway (fail open).</div>\n    <div style=\"height:8px\"></div>\n    <textarea id=\"rules\"></textarea>\n    <div style=\"height:8px\"></div>\n    <div class=\"row\">\n      <button class=\"btn\" onclick=\"saveRules()\">Save rules</button>\n      <input type=\"password\" id=\"gemKey\" placeholder=\"Gemini API key - one-time install, stored as a Cloudflare secret\" style=\"flex:1\">\n      <button class=\"btn ghost\" onclick=\"saveGemKey()\">Install key</button>\n    </div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Status</h2>\n    <div class=\"stat\"><span>Last poll</span><span id=\"sLastPoll\">-</span></div>\n    <div class=\"stat\"><span>Last error</span><span id=\"sLastError\">-</span></div>\n    <div class=\"stat\"><span>WhatsApp link</span><span id=\"sWa\">-</span></div>\n    <div class=\"stat\"><span>Gemini gatekeeper</span><span id=\"sGem\">-</span></div>\n    <div class=\"stat\"><span>Pending account adds</span><span id=\"sPend\">-</span></div>\n    <div class=\"stat\"><span>Today: delivered / dupes skipped / filtered out</span><span id=\"sVol\">-</span></div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Watches</h2>\n    <div class=\"row\" style=\"margin-bottom:8px\">\n      <input type=\"text\" id=\"watchPhrase\" placeholder=\"Alert me when a post mentions...\" style=\"flex:1\">\n      <button class=\"btn\" onclick=\"addWatch()\">Watch</button>\n    </div>\n    <div id=\"watchList\"></div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Subscribers</h2>\n    <div class=\"row\" style=\"margin-bottom:8px\">\n      <input type=\"text\" id=\"subPhone\" placeholder=\"Phone, e.g. 1443...\" style=\"flex:1\">\n      <button class=\"btn\" onclick=\"addSub()\">Add</button>\n    </div>\n    <table><tbody id=\"subRows\"></tbody></table>\n  </div>\n\n  <div class=\"card\">\n    <h2>Access</h2>\n    <div class=\"hint\">Change the dashboard key. Anyone with the key can control the feed - keep it private.</div>\n    <div style=\"height:8px\"></div>\n    <input type=\"password\" id=\"curKey\" placeholder=\"Current key\">\n    <div style=\"height:8px\"></div>\n    <input type=\"password\" id=\"newKey\" placeholder=\"New key (8+ characters)\">\n    <div style=\"height:8px\"></div>\n    <button class=\"btn\" onclick=\"changeKey()\">Change key</button>\n    <span class=\"hint\" id=\"keyMsg\"></span>\n  </div>\n</div>\n<script>\nlet KEY = localStorage.getItem('buff_admin_key') || '';\nasync function api(path, body) {\n  const res = await fetch('/admin/api' + path, {\n    method: body ? 'POST' : 'GET',\n    headers: { 'content-type': 'application/json', 'x-admin-key': KEY },\n    body: body ? JSON.stringify(body) : undefined\n  });\n  if (res.status === 401) { showLogin('Wrong key.'); throw new Error('401'); }\n  return res.json();\n}\nfunction showLogin(err) {\n  document.getElementById('login').classList.remove('hidden');\n  document.getElementById('app').classList.add('hidden');\n  document.getElementById('loginErr').textContent = err || '';\n}\nfunction saveKey() {\n  KEY = document.getElementById('key').value.trim();\n  localStorage.setItem('buff_admin_key', KEY);\n  load();\n}\nfunction esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }\nasync function load() {\n  let s;\n  try { s = await api('/state'); } catch (e) { return; }\n  document.getElementById('login').classList.add('hidden');\n  document.getElementById('app').classList.remove('hidden');\n  const pt = document.getElementById('pauseToggle');\n  pt.classList.toggle('on', !s.paused);\n  document.getElementById('pauseLabel').innerHTML = s.paused ? '<b class=\"bad\">PAUSED</b> - tap to resume' : '<b class=\"ok\">RUNNING</b> - tap to pause';\n  document.querySelectorAll('.modes button').forEach(b => b.classList.toggle('active', b.dataset.mode === s.mode));\n  document.getElementById('modeHint').textContent =\n    s.mode === 'everything' ? 'Everything delivers (muted/link-only filters still apply). Gemini is bypassed.' :\n    s.mode === 'breaking' ? 'Gemini passes only breaking news and event footage, plus your always-deliver rules.' :\n    'Gemini judges every post against your rules below.';\n  const pb = document.getElementById('powerBtn');\n  pb.textContent = s.power === 'off' ? 'Turn bot ON' : 'Turn bot OFF';\n  pb.style.background = s.power === 'off' ? 'var(--green)' : 'var(--red)';\n  pb.style.color = s.power === 'off' ? '#04101f' : '#fff';\n  document.getElementById('powerHint').textContent = s.power === 'off' ? 'Bot is fully OFF.' : 'Bot is on.' + (s.powerConfigured ? '' : ' (power control not wired yet)');\n  document.getElementById('sLastPoll').textContent = s.lastPoll || 'never';\n  document.getElementById('sLastError').textContent = s.lastError || 'none';\n  document.getElementById('sWa').innerHTML = s.waDown ? '<b class=\"bad\">down</b>' : '<b class=\"ok\">connected</b>';\n  document.getElementById('sGem').textContent = s.gemini + (s.geminiUsage != null ? ' (' + s.geminiUsage + ' calls today)' : '');\n  document.getElementById('sPend').textContent = s.pendingAdds.length ? s.pendingAdds.map(p => '@' + p.handle).join(', ') : 'none';\n  document.getElementById('rules').value = (s.rules || []).join('\\n');\n  const d = s.drop || {};\n  document.getElementById('tgLinks').classList.toggle('on', !!(d.links || s.linkOnlyAll));\n  document.getElementById('tgVideo').classList.toggle('on', !!d.video);\n  document.getElementById('tgImage').classList.toggle('on', !!d.image);\n  document.getElementById('tgGif').classList.toggle('on', !!d.gif);\n  document.getElementById('tgDedup').classList.toggle('on', !s.dedupOff);\n  const v = s.volume || {};\n  document.getElementById('sVol').textContent = (v.delivered||0) + ' / ' + (v.suppressed||0) + ' / ' + (v.filtered||0);\n  if (s.pendingRemovals && s.pendingRemovals.length) document.getElementById('sPend').textContent += ' | queued X-removals: ' + s.pendingRemovals.map(p => '@' + p.handle).join(', ');\n  document.getElementById('watchList').innerHTML = (s.watches || []).map(w =>\n    '<span class=\"chip\">' + esc(w.phrase) + ' <button onclick=\"delWatch(\\'' + esc(w.phrase) + '\\')\">&times;</button></span>').join('') || '<span class=\"hint\">None.</span>';\n  document.getElementById('subRows').innerHTML = (s.subscribers || []).map(p =>\n    '<tr><td>' + esc(p.phone) + (p.paused ? ' <span class=\"muted-h\">(paused)</span>' : '') + '</td>' +\n    '<td style=\"text-align:right\"><button class=\"btn danger\" onclick=\"delSub(\\'' + esc(p.phone) + '\\')\">Remove</button></td></tr>').join('') || '<tr><td class=\"muted-h\">None.</td></tr>';\n}\nasync function setPaused() { const s = await api('/state'); await api('/pause', { paused: !s.paused }); load(); }\nasync function setMode(m) { await api('/mode', { mode: m }); load(); }\nasync function saveRules() { await api('/rules', { rules: document.getElementById('rules').value.split('\\n').map(x => x.trim()).filter(Boolean) }); load(); }\nasync function saveGemKey() { const k = document.getElementById('gemKey').value.trim(); if (!k) return; await api('/gemini-key', { key: k }); document.getElementById('gemKey').value = ''; load(); }\nasync function addWatch() { const p = document.getElementById('watchPhrase').value.trim(); if (!p) return; await api('/watch-add', { phrase: p }); document.getElementById('watchPhrase').value = ''; load(); }\nasync function delWatch(p) { await api('/watch-del', { phrase: p }); load(); }\nasync function addSub() { const p = document.getElementById('subPhone').value.trim(); if (!p) return; await api('/sub-add', { phone: p }); document.getElementById('subPhone').value = ''; load(); }\nasync function delSub(p) { await api('/sub-del', { phone: p }); load(); }\nasync function setDrop(k) { const s = await api('/state'); const d = s.drop || {}; const body = {}; body[k] = !(k === 'links' ? (d.links || s.linkOnlyAll) : d[k]); await api('/drop', body); load(); }\nasync function setDedup() { const s = await api('/state'); await api('/dedup', { off: !s.dedupOff }); load(); }\nasync function changeKey() {\n  const msg = document.getElementById('keyMsg');\n  const res = await fetch('/admin/api/admin-key', { method: 'POST', headers: { 'content-type': 'application/json', 'x-admin-key': KEY }, body: JSON.stringify({ current: document.getElementById('curKey').value, next: document.getElementById('newKey').value }) });\n  const j = await res.json().catch(() => ({}));\n  if (res.ok && j.ok) { KEY = document.getElementById('newKey').value; localStorage.setItem('buff_admin_key', KEY); msg.textContent = 'Key changed - you are now using the new key.'; }\n  else msg.textContent = j.error || 'Failed.';\n}\nasync function setPower() { const s = await api('/state'); const on = s.power === 'off'; if (!confirm(on ? 'Turn the bot ON? It resumes from now, no catch-up.' : 'Turn the bot fully OFF? Polling stops and the WhatsApp link suspends.')) return; const r = await api('/power', { on }); if (!r.ok) alert('Power switch had a problem: ' + JSON.stringify(r.steps)); load(); }\nif (KEY) load(); else showLogin();\n</script>\n</body>\n</html>\n";
+const ADMIN_HTML = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>BUFF Admin</title>\n<style>\n  :root { --bg:#0f1115; --card:#181c24; --line:#262c38; --txt:#e8eaf0; --dim:#8b93a5; --accent:#4da3ff; --green:#3ddc84; --red:#ff5c5c; }\n  * { box-sizing:border-box; }\n  body { margin:0; background:var(--bg); color:var(--txt); font:15px/1.45 -apple-system, system-ui, sans-serif; }\n  .wrap { max-width:860px; margin:0 auto; padding:16px; }\n  h1 { font-size:20px; margin:8px 0 2px; }\n  .sub { color:var(--dim); font-size:13px; margin-bottom:16px; }\n  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin-bottom:14px; }\n  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 10px; }\n  .row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }\n  .modes button, .pill { border:1px solid var(--line); background:#10141b; color:var(--txt); border-radius:999px; padding:8px 14px; cursor:pointer; font-size:14px; }\n  .modes button.active { background:var(--accent); border-color:var(--accent); color:#04101f; font-weight:600; }\n  .toggle { width:46px; height:26px; border-radius:999px; background:#2a3140; border:1px solid var(--line); position:relative; cursor:pointer; flex:none; }\n  .toggle::after { content:\"\"; position:absolute; top:2px; left:2px; width:20px; height:20px; border-radius:50%; background:#fff; transition:left .15s; }\n  .toggle.on { background:var(--green); }\n  .toggle.on::after { left:22px; }\n  table { width:100%; border-collapse:collapse; }\n  td, th { text-align:left; padding:7px 6px; border-bottom:1px solid var(--line); font-size:14px; }\n  th { color:var(--dim); font-size:12px; font-weight:600; }\n  .muted-h { color:var(--dim); }\n  input[type=text], input[type=password], textarea { width:100%; background:#10141b; border:1px solid var(--line); color:var(--txt); border-radius:8px; padding:9px 10px; font-size:14px; }\n  textarea { min-height:110px; font-family:inherit; }\n  .btn { background:var(--accent); color:#04101f; border:0; border-radius:8px; padding:9px 14px; font-weight:600; cursor:pointer; }\n  .btn.ghost { background:#10141b; color:var(--txt); border:1px solid var(--line); }\n  .btn.danger { background:transparent; color:var(--red); border:1px solid var(--red); padding:4px 10px; font-size:13px; }\n  .chip { display:inline-flex; align-items:center; gap:8px; background:#10141b; border:1px solid var(--line); border-radius:999px; padding:6px 12px; margin:3px 4px 3px 0; font-size:14px; }\n  .chip button { background:none; border:0; color:var(--red); cursor:pointer; font-size:15px; padding:0; }\n  .stat { display:flex; justify-content:space-between; padding:5px 0; font-size:14px; }\n  .stat span:last-child { color:var(--dim); }\n  .ok { color:var(--green); } .bad { color:var(--red); }\n  #login { max-width:380px; margin:18vh auto 0; }\n  .hint { color:var(--dim); font-size:12px; margin-top:6px; }\n  .hidden { display:none; }\n</style>\n</head>\n<body>\n<div id=\"login\" class=\"card\">\n  <h1>BUFF Admin</h1>\n  <p class=\"sub\">Enter the admin key to manage the feed.</p>\n  <input type=\"password\" id=\"key\" placeholder=\"Admin key\" autocomplete=\"off\">\n  <div style=\"height:10px\"></div>\n  <button class=\"btn\" onclick=\"saveKey()\">Open dashboard</button>\n  <div class=\"hint\" id=\"loginErr\"></div>\n</div>\n<div class=\"wrap hidden\" id=\"app\">\n  <h1>BUFF Admin</h1>\n  <div class=\"sub\">X feed to WhatsApp - live control</div>\n\n  <div class=\"card\">\n    <h2>Feed</h2>\n    <div class=\"row\">\n      <div class=\"toggle\" id=\"pauseToggle\" onclick=\"setPaused()\"></div>\n      <div id=\"pauseLabel\">...</div>\n    </div>\n    <div class=\"hint\">Paused = nothing sends, feed keeps collecting. Start = resume from now. Never a backlog dump.</div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Bot power</h2>\n    <div class=\"row\">\n      <button class=\"btn\" id=\"powerBtn\" onclick=\"setPower()\">...</button>\n      <span class=\"hint\" id=\"powerHint\"></span>\n    </div>\n    <div class=\"hint\">OFF = stops polling and suspends the WhatsApp link (full Shabbos mode). ON = resumes. No catch-up either way - it continues from the moment you switch.</div>\n  </div>\n\n  <div class=\"card modes\">\n    <h2>Shabbos</h2>\n    <div class=\"row\">\n      <button data-smode=\"off\" onclick=\"setShabbosMode('off')\">Fully off</button>\n      <button data-smode=\"digest\" onclick=\"setShabbosMode('digest')\">Silent collect + rundown</button>\n    </div>\n    <div class=\"hint\" id=\"smodeHint\"></div>\n  </div>\n\n  <div class=\"card modes\">\n    <h2>Mode</h2>\n    <div class=\"row\">\n      <button data-mode=\"everything\" onclick=\"setMode('everything')\">Everything</button>\n      <button data-mode=\"breaking\" onclick=\"setMode('breaking')\">Breaking news only</button>\n      <button data-mode=\"custom\" onclick=\"setMode('custom')\">Custom (rules)</button>\n    </div>\n    <div class=\"hint\" id=\"modeHint\"></div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Content filters</h2>\n    <table><tbody>\n      <tr><td>Drop bare article-link posts (all accounts)</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgLinks\" onclick=\"setDrop('links')\"></div></td></tr>\n      <tr><td>Drop posts with videos</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgVideo\" onclick=\"setDrop('video')\"></div></td></tr>\n      <tr><td>Drop posts with images</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgImage\" onclick=\"setDrop('image')\"></div></td></tr>\n      <tr><td>Drop posts with GIFs</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgGif\" onclick=\"setDrop('gif')\"></div></td></tr>\n      <tr><td>Media memory (skip media already sent)</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgDedup\" onclick=\"setDedup()\"></div></td></tr>\n    </tbody></table>\n    <div class=\"hint\">Logo/boilerplate media is handled by media memory - it stays on unless you switch it off here.</div>\n  </div>\n  <div class=\"hint\" style=\"margin:-4px 0 14px\">Account list is managed on X itself. To mute an account or drop its link-only posts without removing it, text the bot: <b>mute @handle</b>, <b>linkonly @handle</b>.</div>\n\n  <div class=\"card\">\n    <h2>Gatekeeper rules (Gemini)</h2>\n    <div class=\"hint\">One rule per line, plain English. Used in Breaking and Custom modes. Default: deliver breaking news AND major updates to ongoing stories; drop routine commentary, opinion, and link-only posts. If Gemini is unreachable, posts deliver anyway (fail open).</div>\n    <div style=\"height:8px\"></div>\n    <textarea id=\"rules\"></textarea>\n    <div style=\"height:8px\"></div>\n    <div class=\"row\">\n      <button class=\"btn\" onclick=\"saveRules()\">Save rules</button>\n      <input type=\"password\" id=\"gemKey\" placeholder=\"Gemini API key - one-time install, stored as a Cloudflare secret\" style=\"flex:1\">\n      <button class=\"btn ghost\" onclick=\"saveGemKey()\">Install key</button>\n    </div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Status</h2>\n    <div class=\"stat\"><span>Last poll</span><span id=\"sLastPoll\">-</span></div>\n    <div class=\"stat\"><span>Last error</span><span id=\"sLastError\">-</span></div>\n    <div class=\"stat\"><span>WhatsApp link</span><span id=\"sWa\">-</span></div>\n    <div class=\"stat\"><span>Gemini gatekeeper</span><span id=\"sGem\">-</span></div>\n    <div class=\"stat\"><span>Pending account adds</span><span id=\"sPend\">-</span></div>\n    <div class=\"stat\"><span>Today: delivered / dupes skipped / filtered out</span><span id=\"sVol\">-</span></div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Watches</h2>\n    <div class=\"row\" style=\"margin-bottom:8px\">\n      <input type=\"text\" id=\"watchPhrase\" placeholder=\"Alert me when a post mentions...\" style=\"flex:1\">\n      <button class=\"btn\" onclick=\"addWatch()\">Watch</button>\n    </div>\n    <div id=\"watchList\"></div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Subscribers</h2>\n    <div class=\"row\" style=\"margin-bottom:8px\">\n      <input type=\"text\" id=\"subPhone\" placeholder=\"Phone, e.g. 1443...\" style=\"flex:1\">\n      <button class=\"btn\" onclick=\"addSub()\">Add</button>\n    </div>\n    <table><tbody id=\"subRows\"></tbody></table>\n  </div>\n\n  <div class=\"card\">\n    <h2>Access</h2>\n    <div class=\"hint\">Change the dashboard key. Anyone with the key can control the feed - keep it private.</div>\n    <div style=\"height:8px\"></div>\n    <input type=\"password\" id=\"curKey\" placeholder=\"Current key\">\n    <div style=\"height:8px\"></div>\n    <input type=\"password\" id=\"newKey\" placeholder=\"New key (8+ characters)\">\n    <div style=\"height:8px\"></div>\n    <button class=\"btn\" onclick=\"changeKey()\">Change key</button>\n    <span class=\"hint\" id=\"keyMsg\"></span>\n  </div>\n</div>\n<script>\nlet KEY = localStorage.getItem('buff_admin_key') || '';\nasync function api(path, body) {\n  const res = await fetch('/admin/api' + path, {\n    method: body ? 'POST' : 'GET',\n    headers: { 'content-type': 'application/json', 'x-admin-key': KEY },\n    body: body ? JSON.stringify(body) : undefined\n  });\n  if (res.status === 401) { showLogin('Wrong key.'); throw new Error('401'); }\n  return res.json();\n}\nfunction showLogin(err) {\n  document.getElementById('login').classList.remove('hidden');\n  document.getElementById('app').classList.add('hidden');\n  document.getElementById('loginErr').textContent = err || '';\n}\nfunction saveKey() {\n  KEY = document.getElementById('key').value.trim();\n  localStorage.setItem('buff_admin_key', KEY);\n  load();\n}\nfunction esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }\nasync function load() {\n  let s;\n  try { s = await api('/state'); } catch (e) { return; }\n  document.getElementById('login').classList.add('hidden');\n  document.getElementById('app').classList.remove('hidden');\n  const pt = document.getElementById('pauseToggle');\n  pt.classList.toggle('on', !s.paused);\n  document.getElementById('pauseLabel').innerHTML = s.paused ? '<b class=\"bad\">PAUSED</b> - tap to resume' : '<b class=\"ok\">RUNNING</b> - tap to pause';\n  document.querySelectorAll('.modes button').forEach(b => b.classList.toggle('active', b.dataset.mode === s.mode));\n  document.querySelectorAll('[data-smode]').forEach(b => b.classList.toggle('active', b.dataset.smode === (s.shabbosMode || 'off')));\n  document.getElementById('smodeHint').textContent = (s.shabbosMode === 'digest') ? 'Collects silently during Shabbos, then sends one sectioned rundown after havdalah.' : 'Fully dark from candle-lighting to havdalah - no collecting, nothing sent. Resumes live after.';\n  document.getElementById('modeHint').textContent =\n    s.mode === 'everything' ? 'Everything delivers (muted/link-only filters still apply). Gemini is bypassed.' :\n    s.mode === 'breaking' ? 'Gemini passes only breaking news and event footage, plus your always-deliver rules.' :\n    'Gemini judges every post against your rules below.';\n  const pb = document.getElementById('powerBtn');\n  pb.textContent = s.power === 'off' ? 'Turn bot ON' : 'Turn bot OFF';\n  pb.style.background = s.power === 'off' ? 'var(--green)' : 'var(--red)';\n  pb.style.color = s.power === 'off' ? '#04101f' : '#fff';\n  document.getElementById('powerHint').textContent = s.power === 'off' ? 'Bot is fully OFF.' : 'Bot is on.' + (s.powerConfigured ? '' : ' (power control not wired yet)');\n  document.getElementById('sLastPoll').textContent = s.lastPoll || 'never';\n  document.getElementById('sLastError').textContent = s.lastError || 'none';\n  document.getElementById('sWa').innerHTML = s.waDown ? '<b class=\"bad\">down</b>' : '<b class=\"ok\">connected</b>';\n  document.getElementById('sGem').textContent = s.gemini + (s.geminiUsage != null ? ' (' + s.geminiUsage + ' calls today)' : '');\n  document.getElementById('sPend').textContent = s.pendingAdds.length ? s.pendingAdds.map(p => '@' + p.handle).join(', ') : 'none';\n  document.getElementById('rules').value = (s.rules || []).join('\\n');\n  const d = s.drop || {};\n  document.getElementById('tgLinks').classList.toggle('on', !!(d.links || s.linkOnlyAll));\n  document.getElementById('tgVideo').classList.toggle('on', !!d.video);\n  document.getElementById('tgImage').classList.toggle('on', !!d.image);\n  document.getElementById('tgGif').classList.toggle('on', !!d.gif);\n  document.getElementById('tgDedup').classList.toggle('on', !s.dedupOff);\n  const v = s.volume || {};\n  document.getElementById('sVol').textContent = (v.delivered||0) + ' / ' + (v.suppressed||0) + ' / ' + (v.filtered||0);\n  if (s.pendingRemovals && s.pendingRemovals.length) document.getElementById('sPend').textContent += ' | queued X-removals: ' + s.pendingRemovals.map(p => '@' + p.handle).join(', ');\n  document.getElementById('watchList').innerHTML = (s.watches || []).map(w =>\n    '<span class=\"chip\">' + esc(w.phrase) + ' <button onclick=\"delWatch(\\'' + esc(w.phrase) + '\\')\">&times;</button></span>').join('') || '<span class=\"hint\">None.</span>';\n  document.getElementById('subRows').innerHTML = (s.subscribers || []).map(p =>\n    '<tr><td>' + esc(p.phone) + (p.paused ? ' <span class=\"muted-h\">(paused)</span>' : '') + '</td>' +\n    '<td style=\"text-align:right\"><button class=\"btn danger\" onclick=\"delSub(\\'' + esc(p.phone) + '\\')\">Remove</button></td></tr>').join('') || '<tr><td class=\"muted-h\">None.</td></tr>';\n}\nasync function setPaused() { const s = await api('/state'); await api('/pause', { paused: !s.paused }); load(); }\nasync function setMode(m) { await api('/mode', { mode: m }); load(); }\nasync function saveRules() { await api('/rules', { rules: document.getElementById('rules').value.split('\\n').map(x => x.trim()).filter(Boolean) }); load(); }\nasync function saveGemKey() { const k = document.getElementById('gemKey').value.trim(); if (!k) return; await api('/gemini-key', { key: k }); document.getElementById('gemKey').value = ''; load(); }\nasync function addWatch() { const p = document.getElementById('watchPhrase').value.trim(); if (!p) return; await api('/watch-add', { phrase: p }); document.getElementById('watchPhrase').value = ''; load(); }\nasync function delWatch(p) { await api('/watch-del', { phrase: p }); load(); }\nasync function addSub() { const p = document.getElementById('subPhone').value.trim(); if (!p) return; await api('/sub-add', { phone: p }); document.getElementById('subPhone').value = ''; load(); }\nasync function delSub(p) { await api('/sub-del', { phone: p }); load(); }\nasync function setDrop(k) { const s = await api('/state'); const d = s.drop || {}; const body = {}; body[k] = !(k === 'links' ? (d.links || s.linkOnlyAll) : d[k]); await api('/drop', body); load(); }\nasync function setDedup() { const s = await api('/state'); await api('/dedup', { off: !s.dedupOff }); load(); }\nasync function changeKey() {\n  const msg = document.getElementById('keyMsg');\n  const res = await fetch('/admin/api/admin-key', { method: 'POST', headers: { 'content-type': 'application/json', 'x-admin-key': KEY }, body: JSON.stringify({ current: document.getElementById('curKey').value, next: document.getElementById('newKey').value }) });\n  const j = await res.json().catch(() => ({}));\n  if (res.ok && j.ok) { KEY = document.getElementById('newKey').value; localStorage.setItem('buff_admin_key', KEY); msg.textContent = 'Key changed - you are now using the new key.'; }\n  else msg.textContent = j.error || 'Failed.';\n}\nasync function setShabbosMode(m) { await api('/shabbos-mode', { mode: m }); load(); }\nasync function setPower() { const s = await api('/state'); const on = s.power === 'off'; if (!confirm(on ? 'Turn the bot ON? It resumes from now, no catch-up.' : 'Turn the bot fully OFF? Polling stops and the WhatsApp link suspends.')) return; const r = await api('/power', { on }); if (!r.ok) alert('Power switch had a problem: ' + JSON.stringify(r.steps)); load(); }\nif (KEY) load(); else showLogin();\n</script>\n</body>\n</html>\n";
 
 
 const XRELOGIN_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>BUFF - Reconnect X</title>
@@ -1186,11 +1259,11 @@ async function handleAdminApi(request, env, url) {
     return Response.json({
       paused: !!(await env.BUFF_KV.get("feed_paused")),
       mode: await getMode(env),
-      lastPoll: await env.BUFF_KV.get("last_poll"),
+      lastPoll: (await loadBS(env)).lastPoll,
       lastError: await env.BUFF_KV.get("last_error"),
       waDown: !!(await env.BUFF_KV.get("wa_down")),
       gemini: env.GEMINI_API_KEY ? "installed (worker secret)" : ((await env.BUFF_KV.get("gemini_key")) ? "installed (legacy KV - reinstall via panel)" : "not set"),
-      geminiUsage: parseInt((await env.BUFF_KV.get(`gem_usage:${day}`)) || "0", 10),
+      geminiUsage: ((await loadBS(env)).gemCalls && (await loadBS(env)).gemCalls.day === day) ? (await loadBS(env)).gemCalls.n : 0,
       rules: await getRules(env),
       drop: (filters.drop || {}),
       linkOnlyAll: lowLO.includes("*"),
@@ -1199,9 +1272,10 @@ async function handleAdminApi(request, env, url) {
       acctRules: await getAcctRules(env),
       pendingAdds: await getPendingAdds(env),
       pendingRemovals: await getJSON(env, "pending_removals", []),
-      volume: (await getJSON(env, `vol:${day}`, null)) || { delivered: 0, suppressed: 0, filtered: 0, deferred: 0 },
+      volume: ((await loadBS(env)).vol && (await loadBS(env)).vol.day === day) ? (await loadBS(env)).vol : { delivered: 0, suppressed: 0, filtered: 0, deferred: 0 },
       power: (await env.BUFF_KV.get("bot_power")) || "on",
       powerConfigured: !!(env.RENDER_API_KEY && env.CF_ADMIN_TOKEN),
+      shabbosMode: await getJSON(env, "shabbos_mode", "off"),
       watches: await getWatches(env),
       subscribers: (await getSubscribers(env)).map((s) => ({ phone: s.phone, paused: !!s.paused })),
     });
@@ -1214,6 +1288,11 @@ async function handleAdminApi(request, env, url) {
   if (path === "/admin/api/mode" && VALID_MODES.includes(body.mode)) {
     await kvPut(env, "feed_mode", body.mode);
     return Response.json({ ok: true });
+  }
+  if (path === "/admin/api/shabbos-mode") {
+    const smode = body.mode === "digest" ? "digest" : "off";
+    await kvPut(env, "shabbos_mode", smode);
+    return Response.json({ ok: true, mode: smode });
   }
   if (path === "/admin/api/mute" || path === "/admin/api/linkonly") {
     const h = cleanHandle(body.handle);
@@ -1428,22 +1507,29 @@ export default {
         const t0 = Date.now();
         // heartbeat FIRST (fire-and-forget): proves the cron fired and keeps the Render free-tier socket warm; awaiting it costs up to 10s of the tick budget
         fetch(env.BRIDGE_URL + "/status", { headers: { authorization: env.BRIDGE_SECRET }, signal: AbortSignal.timeout(10000) }).catch(() => {});
-        const healthTick = new Date().getUTCMinutes() % 5 === 0; // while the KV write budget is constrained, health markers get written every 5th tick only
-        if (healthTick) await kvPut(env, "last_poll", `${new Date().toISOString()} tick`);
+        // Shabbos FULL-OFF (the default since 2026-09-06, Ezra): inside the window the tick goes fully dark -
+        // no X fetch, no Gemini, no state writes. "digest" mode keeps the silent-collect + post-havdalah rundown.
+        const holdNow = await shabbosHoldActive(env);
+        if (holdNow && (await getJSON(env, "shabbos_mode", "off")) !== "digest") return;
+        const bs = await loadBS(env);
         // Shabbos release FIRST: window over + digest pending -> send the one rundown before the poll can eat the
         // tick's time budget. pending flag deleted only AFTER a successful send, so a killed tick retries next minute.
         try {
-          if (!(await shabbosHoldActive(env)) && (await env.BUFF_KV.get("shabbos_digest_pending"))) {
+          if (!holdNow && (await env.BUFF_KV.get("shabbos_digest_pending"))) {
             await sendShabbosDigest(env);
             await env.BUFF_KV.delete("shabbos_digest_pending");
           }
         } catch (e) {}
         try {
-          const purged = new Date().getUTCMinutes() % 15 === 0 ? await purgeOldSent(env) : 0; // Plan B auto-clear, gated to every 15th tick - the sent: keyspace is big and per-tick purges were blowing the tick time budget
+          bs.lastPoll = `${new Date().toISOString()} tick`;
+          bs.dirty = true;
+          const purged = new Date().getUTCMinutes() % 15 === 0 ? await bsPurgeSent(env, bs) : 0; // Plan B auto-clear from the blob, gated to every 15th tick
           const result = await poll(env, 6); // cap per-tick deliveries so the run stays inside the cron time budget; remainder flows next minute
           const done = `${new Date().toISOString()} ${result}${purged ? ` purged=${purged}` : ""} (${Date.now() - t0}ms)`;
-          if (healthTick) { await kvPut(env, "last_poll", done); await kvPut(env, "last_done", done); } // every 5th tick - see healthTick above
+          bs.lastPoll = done; bs.lastDone = done; bs.dirty = true;
+          await saveBS(env, bs, new Date().getUTCMinutes() % 5 === 0); // health markers persist every 5th tick (delivery ticks force-saved inside poll)
         } catch (e) {
+          try { await saveBS(env, bs, false); } catch (e0) {}
           try {
             const msg = `${new Date().toISOString()} ${e.message}`;
             const prev = await env.BUFF_KV.get("last_error");
@@ -1460,8 +1546,9 @@ export default {
     if (url.pathname.startsWith("/admin/api/")) return handleAdminApi(request, env, url);
     if (url.pathname === "/incoming" && request.method === "POST") return handleIncoming(request, env);
     if (url.pathname === "/health") {
-      const lastPoll = await env.BUFF_KV.get("last_poll");
-      const lastDone = await env.BUFF_KV.get("last_done");
+      const bsH = await loadBS(env);
+      const lastPoll = bsH.lastPoll;
+      const lastDone = bsH.lastDone;
       const lastError = await env.BUFF_KV.get("last_error");
       const pausedF = !!(await env.BUFF_KV.get("feed_paused"));
       const waDown = !!(await env.BUFF_KV.get("wa_down"));
