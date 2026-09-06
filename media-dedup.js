@@ -140,18 +140,20 @@ async function kvRestore() {
     console.log(`[dedup] restored ${seen.size} phashes from KV`);
   } catch (e) { console.error('[dedup] KV restore failed (fail-open):', e.message); }
 }
+let lastFlushOk = null, lastFlushAt = null, lastFlushErr = null;
 async function kvFlush(force) {
   if (!dirty && !force) return;
-  if (!ACCOUNT || !NAMESPACE || !TOKEN) return;
+  if (!ACCOUNT || !NAMESPACE || !TOKEN) { lastFlushErr = 'kv env missing'; return; }
   try {
     evict();
     const body = JSON.stringify([...seen.entries()]);
     const r = await fetch(`${API}/${encodeURIComponent(KV_KEY)}`, {
       method: 'PUT', headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }, body
     });
-    if (!r.ok) throw new Error('KV PUT ' + r.status);
-    dirty = false;
-  } catch (e) { console.error('[dedup] KV flush failed:', e.message); }
+    if (!r.ok) throw new Error('KV PUT ' + r.status + ': ' + (await r.text()).slice(0, 120));
+    dirty = false; lastFlushOk = true; lastFlushAt = new Date().toISOString(); lastFlushErr = null;
+    console.log(`[dedup] flushed ${seen.size} phashes to KV`);
+  } catch (e) { lastFlushOk = false; lastFlushErr = String(e.message || e); console.error('[dedup] KV flush failed:', e.message); }
 }
 
 export async function initDedup() {
@@ -203,5 +205,5 @@ export async function checkMedia({ imageUrl, videoUrl }) {
 }
 
 export function dedupStatus() {
-  return { enabled: !!Jimp, ffmpeg: !!ffmpegPath, size: seen.size, ...stats };
+  return { enabled: !!Jimp, ffmpeg: !!ffmpegPath, size: seen.size, kv: { configured: !!(ACCOUNT && NAMESPACE && TOKEN), lastFlushOk, lastFlushAt, lastFlushErr }, ...stats };
 }
