@@ -1329,4 +1329,318 @@ async function handleAdminApi(request, env, url) {
       accounts,
       acctRules: await getAcctRules(env),
       pendingAdds: await getPendingAdds(env),
-  
+      pendingRemovals: await getJSON(env, "pending_removals", []),
+      volume: ((await loadBS(env)).vol && (await loadBS(env)).vol.day === day) ? (await loadBS(env)).vol : { delivered: 0, suppressed: 0, filtered: 0, deferred: 0 },
+      power: (await env.BUFF_KV.get("bot_power")) || "on",
+      powerConfigured: !!(env.RENDER_API_KEY && env.CF_ADMIN_TOKEN),
+      shabbosMode: await getJSON(env, "shabbos_mode", "off"),
+      watches: await getWatches(env),
+      subscribers: (await getSubscribers(env)).map((s) => ({ phone: s.phone, paused: !!s.paused })),
+    });
+  }
+
+  if (path === "/admin/api/pause") {
+    if (body.paused) await kvPut(env, "feed_paused", "1"); else await env.BUFF_KV.delete("feed_paused");
+    return Response.json({ ok: true });
+  }
+  if (path === "/admin/api/mode" && VALID_MODES.includes(body.mode)) {
+    await kvPut(env, "feed_mode", body.mode);
+    return Response.json({ ok: true });
+  }
+  if (path === "/admin/api/shabbos-mode") {
+    const smode = body.mode === "digest" ? "digest" : "off";
+    await kvPut(env, "shabbos_mode", smode);
+    return Response.json({ ok: true, mode: smode });
+  }
+  if (path === "/admin/api/mute" || path === "/admin/api/linkonly") {
+    const h = cleanHandle(body.handle);
+    if (!h) return Response.json({ error: "bad handle" }, { status: 400 });
+    const filters = await getFilters(env);
+    const list = path === "/admin/api/mute" ? "muted" : "linkOnly";
+    const on = path === "/admin/api/mute" ? !!body.muted : !!body.on;
+    filters[list] = filters[list] || [];
+    const low = filters[list].map((x) => String(x).toLowerCase());
+    const i = low.indexOf(h.toLowerCase());
+    if (on && i < 0) filters[list].push(h);
+    if (!on && i >= 0) filters[list].splice(i, 1);
+    await kvPut(env, "filters_v1", JSON.stringify(filters));
+    return Response.json({ ok: true });
+  }
+  if (path === "/admin/api/drop") {
+    const filters = await getFilters(env);
+    filters.drop = filters.drop || {};
+    for (const k of ["links", "video", "image", "gif"]) if (k in body) filters.drop[k] = !!body[k];
+    await kvPut(env, "filters_v1", JSON.stringify(filters));
+    return Response.json({ ok: true });
+  }
+  if (path === "/admin/api/dedup") {
+    if (body.off) await kvPut(env, "dedup_off", "1"); else await env.BUFF_KV.delete("dedup_off");
+    return Response.json({ ok: true });
+  }
+  if (path === "/admin/api/add-account") {
+    const h = cleanHandle(body.handle);
+    if (!h) return Response.json({ error: "bad handle" }, { status: 400 });
+    const pending = await getPendingAdds(env);
+    if (!pending.some((p) => String(p.handle).toLowerCase() === h.toLowerCase())) {
+      pending.push({ handle: h, at: Date.now() });
+      await kvPut(env, "pending_adds", JSON.stringify(pending));
+    }
+    return Response.json({ ok: true, staged: h });
+  }
+  if (path === "/admin/api/rules" && Array.isArray(body.rules)) {
+    const rules = body.rules.map((r) => String(r).slice(0, 500)).filter(Boolean).slice(0, 40);
+    await kvPut(env, "gemini_rules", JSON.stringify(rules));
+    return Response.json({ ok: true, count: rules.length });
+  }
+  if (path === "/admin/api/gemini-key") {
+    // Secret-handling (2026-09-04): the Gemini key is a persistent secret. It installs as a
+    // Cloudflare Worker SECRET binding via the CF API - never written to KV, never returned by any endpoint.
+    const k = String(body.key || "").trim();
+    if (k.length < 10) return Response.json({ error: "key too short" }, { status: 400 });
+    const r = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/buff-feed-bot/secrets`, {
+      method: "PUT",
+      headers: { authorization: `Bearer ${env.CF_ADMIN_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify({ name: "GEMINI_API_KEY", text: k, type: "secret_text" }),
+      signal: AbortSignal.timeout(15000)
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.success) return Response.json({ ok: false, error: "cloudflare secret install failed: " + (j.errors?.[0]?.message || r.status) }, { status: 502 });
+    // clean up any legacy KV copy so the secret binding is the only resting place
+    try { await env.BUFF_KV.delete("gemini_key"); } catch (e) {}
+    return Response.json({ ok: true, installed: "worker_secret" });
+  }
+  if (path === "/admin/api/x-relogin" && request.method === "POST") {
+    // Runs the X login flow server-side. Credentials arrive over HTTPS from the panel, cookies go straight to KV. Never logged, never returned.
+    const username = String(body.username || "").trim();
+    const password = String(body.password || "");
+    const email = String(body.email || "").trim();
+    if (!username || !password) return Response.json({ error: "username and password required" }, { status: 400 });
+    try {
+      let r = await xLoginFlow(username, password, email, "api.x.com");
+      if (!r.auth_token && /400|403/.test(String(r.error))) r = await xLoginFlow(username, password, email, "api.twitter.com");
+      if (!r.auth_token) return Response.json({ ok: false, error: r.error, detail: r.detail, seen: r.seen }, { status: 502 });
+      await kvPut(env, "x_session", JSON.stringify({ auth_token: r.auth_token, ct0: r.ct0, ts: Date.now() }));
+      // verify against the real list timeline before declaring success
+      let verify = "untested";
+      try {
+        const t = await fetchListTimeline(env); // reads the session we just wrote to KV
+        verify = t.length > 200 ? "ok" : "empty";
+      } catch (e) { verify = "verify failed: " + (e.message || e); }
+      return Response.json({ ok: true, stored: true, verify, seen: r.seen });
+    } catch (e) {
+      return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 });
+    }
+  }
+  if (path === "/admin/api/x-session-set" && request.method === "POST") {
+    // Receives X session cookies over HTTPS, validates against the real list timeline, stores in KV only if valid. Never logged or returned.
+    const at = String(body.auth_token || "").trim();
+    const ct = String(body.ct0 || "").trim();
+    if (!at || !ct) return Response.json({ error: "auth_token and ct0 required" }, { status: 400 });
+    const vars = { listId: env.X_LIST_ID, count: 5 };
+    const url2 = `https://x.com/i/api/graphql/${QID_LIST}/ListLatestTweetsTimeline?variables=${encodeURIComponent(JSON.stringify(vars))}&features=${encodeURIComponent(JSON.stringify(X_FEATURES))}`;
+    try {
+      const res = await fetch(url2, { headers: { authorization: `Bearer ${X_BEARER}`, "x-csrf-token": ct, cookie: `auth_token=${at}; ct0=${ct}`, "user-agent": X_UA, "x-twitter-active-user": "yes", "x-twitter-auth-type": "OAuth2Session" }, signal: AbortSignal.timeout(20000) });
+      if (!res.ok) return Response.json({ ok: false, stored: false, verify: "HTTP " + res.status }, { status: 502 });
+      const t = await res.text();
+      if (t.length < 200) return Response.json({ ok: false, stored: false, verify: "empty response" }, { status: 502 });
+      await kvPut(env, "x_session", JSON.stringify({ auth_token: at, ct0: ct, ts: Date.now() }));
+      return Response.json({ ok: true, stored: true, verify: "ok" });
+    } catch (e) {
+      return Response.json({ ok: false, stored: false, verify: String(e.message || e) }, { status: 500 });
+    }
+  }
+  if (path === "/admin/api/shabbos-preview") {
+    // Dry-run the Shabbos digest against recent kept feed items (or the live shabbos_items buffer). Sends nothing.
+    const buf = await getJSON(env, "shabbos_items", []);
+    const items = buf.length ? buf : (await getFeedItems(env)).slice(-40);
+    const parts = await sendShabbosDigest(env, { items, dryRun: true });
+    return Response.json({ ok: true, buffered: buf.length, used: items.length, parts: parts && parts.length ? parts.length : 0, preview: parts });
+  }
+
+  if (path === "/admin/api/gemini-test") {
+    // Dry-run the gatekeeper against the most recent retained feed items. Returns verdicts, never the key.
+    const key = await getGeminiKey(env);
+    if (!key) return Response.json({ ok: false, error: "no gemini key installed" }, { status: 400 });
+    const items = (await getFeedItems(env)).slice(-10);
+    if (!items.length) return Response.json({ ok: false, error: "no retained feed items to test" });
+    const rules = await getRules(env);
+    const mode = await getMode(env);
+    const acctRules = await getAcctRules(env);
+    // reachability probe first: fail-open would otherwise mask a dead key as "deliver everything"
+    let reachable = false, probeErr = null;
+    try {
+      const probe = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
+        method: "POST", headers: { "content-type": "application/json", "x-goog-api-key": key },
+        body: JSON.stringify({ model: GEMINI_MODEL, input: "Reply with the word OK", store: false, generation_config: { max_output_tokens: 8, thinking_level: "minimal" } }),
+        signal: AbortSignal.timeout(20000)
+      });
+      reachable = probe.ok;
+      if (!probe.ok) probeErr = "HTTP " + probe.status;
+    } catch (e) { probeErr = String(e.message || e); }
+    const verdicts = await geminiClassify(env, key, rules, mode, items, acctRules);
+    const out = items.map((t) => { const gv = verdicts.get(t.id) || {}; return { id: t.id, account: "@" + t.handle, deliver: gv.d !== false, reason: gv.r, text: (t.text || t.origText || "").slice(0, 80) }; });
+    return Response.json({ ok: true, geminiReachable: reachable, probeError: probeErr, mode, tested: out.length, deliver: out.filter((v) => v.deliver).length, drop: out.filter((v) => !v.deliver).length, verdicts: out });
+  }
+  if (path === "/admin/api/translate-test") {
+    // Production-context probe of BOTH translation rails on a Hebrew sample (2026-09-06 "(untranslated)" storm).
+    const sample = "\u05de\u05d8\u05d5\u05e1 \u05d0\u05de\u05d6\u05d5\u05df \u05d4\u05ea\u05e8\u05d5\u05e7\u05e7 \u05d1\u05de\u05d9\u05d0\u05de\u05d9";
+    const t0 = Date.now();
+    GTX_DEAD_UNTIL = 0; // force-probe gtx even if dead-cached
+    const gx = await translateGtx(sample);
+    const t1 = Date.now();
+    const gm = await translateGemini(env, sample);
+    const t2 = Date.now();
+    return Response.json({ ok: true, sample,
+      gtx: { result: gx, ms: t1 - t0, deadCachedUntil: GTX_DEAD_UNTIL || null },
+      gemini: { result: gm, ms: t2 - t1 },
+      detectionOnEnglish: hasNonEnglish("Breaking: plane crashed in Miami, officials say") });
+  }
+
+  if (path === "/admin/api/admin-key") {
+    const configured = (await env.BUFF_KV.get("admin_key")) || env.ADMIN_SECRET;
+    if (body.current !== configured) return Response.json({ error: "current key wrong" }, { status: 403 });
+    const next = String(body.next || "").trim();
+    if (next.length < 8) return Response.json({ error: "new key must be 8+ chars" }, { status: 400 });
+    await kvPut(env, "admin_key", next);
+    return Response.json({ ok: true });
+  }
+  if (path === "/admin/api/acct-rule") {
+    const h = cleanHandle(body.handle);
+    if (!h) return Response.json({ error: "bad handle" }, { status: 400 });
+    const rules = await getAcctRules(env);
+    const rule = String(body.rule || "").trim().slice(0, 500);
+    if (rule) rules[h.toLowerCase()] = rule; else delete rules[h.toLowerCase()];
+    await kvPut(env, "acct_rules", JSON.stringify(rules));
+    return Response.json({ ok: true });
+  }
+  if (path === "/admin/api/remove-account") {
+    // instant delivery stop (mute) + queue the actual X-list removal for the list agent's slow cadence
+    const h = cleanHandle(body.handle);
+    if (!h) return Response.json({ error: "bad handle" }, { status: 400 });
+    const filters = await getFilters(env);
+    filters.muted = filters.muted || [];
+    if (!filters.muted.map((x) => String(x).toLowerCase()).includes(h.toLowerCase())) {
+      filters.muted.push(h);
+      await kvPut(env, "filters_v1", JSON.stringify(filters));
+    }
+    const rem = await getJSON(env, "pending_removals", []);
+    if (!rem.some((r) => String(r.handle).toLowerCase() === h.toLowerCase())) {
+      rem.push({ handle: h, at: Date.now() });
+      await kvPut(env, "pending_removals", JSON.stringify(rem));
+    }
+    return Response.json({ ok: true, muted: h, queued: true });
+  }
+  if (path === "/admin/api/power") {
+    const on = !!body.on;
+    const steps = {};
+    if (on) {
+      steps.bridge = await renderPower(env, "resume");
+      steps.cron = await cfSchedules(env, true);
+      await env.BUFF_KV.delete("bot_power");
+    } else {
+      steps.cron = await cfSchedules(env, false);
+      steps.bridge = await renderPower(env, "suspend");
+      await kvPut(env, "bot_power", "off");
+    }
+    return Response.json({ ok: Object.values(steps).every((s) => s.ok !== false), on, steps });
+  }
+  if (path === "/admin/api/watch-add" || path === "/admin/api/watch-del") {
+    const phrase = String(body.phrase || "").trim().slice(0, 120);
+    if (!phrase) return Response.json({ error: "bad phrase" }, { status: 400 });
+    let watches = await getWatches(env);
+    if (path.endsWith("watch-add")) {
+      if (!watches.some((w) => w.phrase.toLowerCase() === phrase.toLowerCase())) watches.push({ phrase, at: Date.now() });
+    } else {
+      watches = watches.filter((w) => w.phrase.toLowerCase() !== phrase.toLowerCase());
+    }
+    await kvPut(env, "watches", JSON.stringify(watches));
+    return Response.json({ ok: true });
+  }
+  if (path === "/admin/api/sub-add" || path === "/admin/api/sub-del") {
+    const phone = digits(body.phone);
+    if (phone.length < 10) return Response.json({ error: "bad phone" }, { status: 400 });
+    let subs = await getSubscribers(env);
+    if (path.endsWith("sub-add")) {
+      if (!subs.some((s) => s.phone === phone)) subs.push({ phone, paused: false });
+    } else {
+      subs = subs.filter((s) => s.phone !== phone);
+    }
+    await kvPut(env, "subscribers", JSON.stringify(subs));
+    return Response.json({ ok: true });
+  }
+  return Response.json({ error: "unknown admin route" }, { status: 404 });
+}
+
+// ---------- entrypoints ----------
+
+export default {
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      (async () => {
+        const t0 = Date.now();
+        // heartbeat FIRST (fire-and-forget): proves the cron fired and keeps the Render free-tier socket warm; awaiting it costs up to 10s of the tick budget
+        fetch(env.BRIDGE_URL + "/status", { headers: { authorization: env.BRIDGE_SECRET }, signal: AbortSignal.timeout(10000) }).catch(() => {});
+        // Shabbos FULL-OFF (the default since 2026-09-06, Ezra): inside the window the tick goes fully dark -
+        // no X fetch, no Gemini, no state writes. "digest" mode keeps the silent-collect + post-havdalah rundown.
+        const holdNow = await shabbosHoldActive(env);
+        if (holdNow && (await getJSON(env, "shabbos_mode", "off")) !== "digest") return;
+        const bs = await loadBS(env);
+        // Shabbos release FIRST: window over + digest pending -> send the one rundown before the poll can eat the
+        // tick's time budget. pending flag deleted only AFTER a successful send, so a killed tick retries next minute.
+        try {
+          if (!holdNow && (await env.BUFF_KV.get("shabbos_digest_pending"))) {
+            await sendShabbosDigest(env);
+            await env.BUFF_KV.delete("shabbos_digest_pending");
+          }
+        } catch (e) {}
+        try {
+          bs.lastPoll = `${new Date().toISOString()} tick`;
+          bs.dirty = true;
+          const purged = new Date().getUTCMinutes() % 15 === 0 ? await bsPurgeSent(env, bs) : 0; // Plan B auto-clear from the blob, gated to every 15th tick
+          const result = await poll(env, 6); // cap per-tick deliveries so the run stays inside the cron time budget; remainder flows next minute
+          const done = `${new Date().toISOString()} ${result}${purged ? ` purged=${purged}` : ""} (${Date.now() - t0}ms)`;
+          bs.lastPoll = done; bs.lastDone = done; bs.dirty = true;
+          await saveBS(env, bs, new Date().getUTCMinutes() % 5 === 0); // health markers persist every 5th tick (delivery ticks force-saved inside poll)
+        } catch (e) {
+          try { await saveBS(env, bs, false); } catch (e0) {}
+          try {
+            const msg = `${new Date().toISOString()} ${e.message}`;
+            const prev = await env.BUFF_KV.get("last_error");
+            if (!prev || prev.slice(24) !== msg.slice(24)) await kvPut(env, "last_error", msg);
+          } catch (e2) {}
+        }
+      })()
+    );
+  },
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (url.pathname === "/admin" && request.method === "GET") return new Response(ADMIN_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+    if (url.pathname === "/admin/x-relogin" && request.method === "GET") return new Response(XRELOGIN_HTML, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+    if (url.pathname.startsWith("/admin/api/")) return handleAdminApi(request, env, url);
+    if (url.pathname === "/incoming" && request.method === "POST") return handleIncoming(request, env);
+    if (url.pathname === "/health") {
+      const bsH = await loadBS(env);
+      const lastPoll = bsH.lastPoll;
+      const lastDone = bsH.lastDone;
+      const lastError = await env.BUFF_KV.get("last_error");
+      const pausedF = !!(await env.BUFF_KV.get("feed_paused"));
+      const waDown = !!(await env.BUFF_KV.get("wa_down"));
+      const subs = await getSubscribers(env);
+      const filters = await getFilters(env);
+  const watches = await getWatches(env);
+  const retained = []; // pushed into feed_items at the end (one batched write)
+      const pending = await getPendingAdds(env);
+      return Response.json({ ok: true, lastPoll, lastDone, lastError, paused: pausedF, waDown, subscribers: subs.length, filters, pendingAdds: pending, mode: await getMode(env) });
+    }
+    if (url.pathname === "/poll-now" && [env.VERIFY_TOKEN, env.BRIDGE_SECRET].includes(url.searchParams.get("key"))) {
+      const diag = url.searchParams.get("diag") ? {} : null;
+      try {
+        const result = await poll(env, undefined, diag);
+        return Response.json(diag ? { result, diag } : { result });
+      } catch (e) {
+        return Response.json({ error: String(e && e.message || e), diag }, { status: 500 });
+      }
+    }
+    return new Response("buff", { status: 200 });
+  }
+};
