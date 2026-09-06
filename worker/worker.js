@@ -176,47 +176,86 @@ function stripLinks(text) {
     .trim();
 }
 
-// ---------- translation: non-English posts deliver original + English underneath (fail open) ----------
-// Free Google gtx endpoint, no key needed. Only fires when non-English letters are detected.
+// ---------- translation: non-English posts deliver original + English underneath ----------
+// Standing rule (Ezra 2026-09-06): a non-English post that CANNOT be translated is DROPPED,
+// never delivered untranslated. Rails: Gemini Interactions API first (reliable from Workers -
+// the free Google gtx endpoint is effectively blocked from CF edge IPs, ~all calls failed),
+// gtx as fallback with a 5-min dead-cache so a blocked gtx doesn't stall every post.
+// withTranslation returns null when translation was needed but both rails failed.
+let GTX_DEAD_UNTIL = 0;
 function hasNonEnglish(text) {
   if (!text) return false;
-  return /[^\u0000-\u007F]/.test(text.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}©®™\u{20E3}\u{E0020}-\u{E007F}]/gu, "")) && /[^\u0000-\u007F]*\p{L}/u.test(text) && /\p{L}[^\u0000-\u007F]|[^\u0000-\u007F]\p{L}/u.test(text);
+  const stripped = text.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{2018}\u{2019}\u{201C}\u{201D}\u{2013}\u{2014}\u{2026}©®™\u{20E3}\u{E0020}-\u{E007F}]/gu, "");
+  return /[^\u0000-\u007F]/.test(stripped) && /\p{L}/u.test(stripped) && /\p{L}[^\u0000-\u007F]|[^\u0000-\u007F]\p{L}/u.test(stripped);
 }
-async function translateToEnglish(text) {
-  // returns translated string, or null on any failure (caller delivers original + "(untranslated)")
+async function translateGtx(text) {
+  if (Date.now() < GTX_DEAD_UNTIL) return null;
   try {
     const url = "https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=en&q=" + encodeURIComponent(text.slice(0, 4000));
-    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-    if (!res.ok) return null;
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) throw new Error("gtx HTTP " + res.status);
     const data = await res.json();
     const out = (Array.isArray(data) ? data : []).map(seg => seg && seg[0] || "").join("").trim();
-    if (!out) return null;
-    // same language already (gtx echo) or identical -> no translation block needed
-    if (out.toLowerCase() === text.trim().toLowerCase()) return "";
-    return out;
+    return out || null;
+  } catch (e) { GTX_DEAD_UNTIL = Date.now() + 5 * 60 * 1000; return null; }
+}
+async function translateGemini(env, text) {
+  try {
+    const key = await getGeminiKey(env);
+    if (!key) return null;
+    const res = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-goog-api-key": key },
+      body: JSON.stringify({ model: GEMINI_MODEL, input: "Translate this social media post to English. Output ONLY the translation, preserving names and numbers. If it is already in English, output it unchanged.\n\n" + text.slice(0, 4000), store: false, generation_config: { temperature: 0, max_output_tokens: 2000, thinking_level: "minimal" } }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const out = (data.steps || []).filter((st) => st && st.type === "model_output").flatMap((st) => st.content || []).filter((c) => c && c.type === "text").map((c) => c.text || "").join("").trim();
+    if (out) {
+      const day = new Date().toISOString().slice(0, 10);
+      const bsU = await loadBS(env);
+      if (!bsU.gemCalls || bsU.gemCalls.day !== day) bsU.gemCalls = { day, n: 0 };
+      bsU.gemCalls.n++; bsU.dirty = true;
+    }
+    return out || null;
   } catch (e) { return null; }
 }
-async function withTranslation(text) {
+// returns translated string, "" when already-English (no block needed), null on total failure
+async function translateToEnglish(env, text) {
+  const g = await translateGemini(env, text);
+  if (g !== null) return g.toLowerCase() === text.trim().toLowerCase() ? "" : g;
+  const x = await translateGtx(text);
+  if (x !== null) return x.toLowerCase() === text.trim().toLowerCase() ? "" : x;
+  return null;
+}
+// null => untranslatable, caller drops the whole post (media included)
+async function withTranslation(env, text) {
   const clean = text;
   if (!hasNonEnglish(clean)) return clean;
-  const tr = await translateToEnglish(clean);
-  if (tr === null) return clean + "\n\n(untranslated)";
+  const tr = await translateToEnglish(env, clean);
+  if (tr === null) return null;
   if (tr === "") return clean;
   return clean + "\n\n----------\nEN: " + tr;
 }
 
 // ---------- message formatting: every message leads with bold Display Name (@handle) ----------
 
-async function formatBody(t) {
-  // Ezra 2026-09-03: strip t.co/x.com links (content only, no URLs); non-English gets original + English underneath
-  const clean = async (s) => withTranslation(stripLinks(s || "") || "(link only)");
+async function formatBody(env, t) {
+  // Ezra 2026-09-03: strip t.co/x.com links (content only, no URLs); non-English gets original + English underneath.
+  // Returns null when a segment needs translation but both rails failed - caller drops the whole post (Ezra 2026-09-06 rule).
+  const clean = async (s) => withTranslation(env, stripLinks(s || "") || "(link only)");
   if (t.kind === "retweet") {
-    return `*${t.name} (@${t.handle})* retweeted *${t.origName} (@${t.origHandle})*:\n\n${await clean(t.origText)}`;
+    const c = await clean(t.origText); if (c === null) return null;
+    return `*${t.name} (@${t.handle})* retweeted *${t.origName} (@${t.origHandle})*:\n\n${c}`;
   }
   if (t.kind === "quote") {
-    return `*${t.name} (@${t.handle})* commented:\n${await clean(t.text)}\n\n----------\n*${t.quotedName} (@${t.quotedHandle})* posted:\n${await clean(t.quotedText)}`;
+    const c1 = await clean(t.text); if (c1 === null) return null;
+    const c2 = await clean(t.quotedText); if (c2 === null) return null;
+    return `*${t.name} (@${t.handle})* commented:\n${c1}\n\n----------\n*${t.quotedName} (@${t.quotedHandle})* posted:\n${c2}`;
   }
-  return `*${t.name} (@${t.handle})*\n\n${await clean(t.text)}`;
+  const c = await clean(t.text); if (c === null) return null;
+  return `*${t.name} (@${t.handle})*\n\n${c}`;
 }
 
 // ---------- Shabbos hold (2026-09-04, Ezra) ----------
@@ -472,7 +511,11 @@ async function mediaFingerprint(m) {
 }
 
 async function deliverTweet(env, t) {
-  // media first (no captions), then the labeled text message. Returns count of media suppressed as exact duplicates.
+  // media first (no captions), then the labeled text message.
+  // Returns { suppressed, untranslated }: media suppressed as exact duplicates; untranslated=1 when the post
+  // was DROPPED because it needed translation and both rails failed (nothing delivered, media included).
+  const body = await formatBody(env, t);
+  if (body === null) return { suppressed: 0, untranslated: 1 };
   let suppressed = 0;
   const dedupOff = !!(await env.BUFF_KV.get("dedup_off"));
   for (const m of t.media) {
@@ -485,8 +528,8 @@ async function deliverTweet(env, t) {
     await deliverToAll(env, m.kind === "image" ? { imageUrl: m.url } : { videoUrl: m.url });
     await sleep(250);
   }
-  await deliverToAll(env, { text: await formatBody(t) });
-  return suppressed;
+  await deliverToAll(env, { text: body });
+  return { suppressed, untranslated: 0 };
 }
 
 // ---------- state helpers (batched KV keys to stay under free-tier write quota) ----------
@@ -685,7 +728,7 @@ async function poll(env, maxDeliver, diag) {
 
   const holding = paused || waDown; // deliveries off: still collect, mark seen, retain for queries - resume from NOW, never a backlog dump
 
-  let delivered = 0, dropped = 0, deferred = 0, filtered = 0, suppressed = 0;
+  let delivered = 0, dropped = 0, deferred = 0, filtered = 0, suppressed = 0, untranslated = 0;
   // Gemini gatekeeper: batch-classify this tick's delivery candidates (max 10/tick, cached per tweet). FAIL-OPEN.
   const feedMode = await getMode(env);
   if (!holding && feedMode !== "everything") {
@@ -784,7 +827,14 @@ async function poll(env, maxDeliver, diag) {
       }
     } catch (e) { fp = null; }
     try {
-      suppressed += await deliverTweet(env, t);
+      const dres = await deliverTweet(env, t);
+      suppressed += dres.suppressed;
+      if (dres.untranslated) {
+        untranslated++;
+        bsSeenAdd(bs, id); // seen, not delivered: never retry, never show untranslated (Ezra 2026-09-06)
+        retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), untranslated: true });
+        continue;
+      }
       if (fp && fp.u.size) stories.push({ u: [...fp.u].slice(0, 60), e: [...fp.e].slice(0, 40), at: Date.now() });
       retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now() });
       const hit = watchHit(t, watches);
@@ -828,7 +878,7 @@ async function poll(env, maxDeliver, diag) {
   bs.vol.delivered += delivered; bs.vol.suppressed += suppressed; bs.vol.filtered += filtered; bs.vol.deferred += deferred;
   if (delivered || suppressed || filtered || deferred) bs.dirty = true;
   await saveBS(env, bs, delivered > 0); // force-persist on delivery ticks; otherwise the 2-min throttle governs
-  return `delivered=${delivered} dropped=${dropped} skipped=${skipped} filtered=${filtered} deferred=${deferred} suppressed=${suppressed}${storyDupes ? ` storydupes=${storyDupes}` : ""}${held ? ` held=${held}` : ""}${shabbos ? " shabbos" : ""}${paused ? " paused" : ""}${waDown ? " wa_down" : ""}`;
+  return `delivered=${delivered} dropped=${dropped} skipped=${skipped} filtered=${filtered} deferred=${deferred} suppressed=${suppressed}${untranslated ? ` untr=${untranslated}` : ""}${storyDupes ? ` storydupes=${storyDupes}` : ""}${held ? ` held=${held}` : ""}${shabbos ? " shabbos" : ""}${paused ? " paused" : ""}${waDown ? " wa_down" : ""}`;
 }
 
 // ---------- commands ----------
@@ -1423,6 +1473,21 @@ async function handleAdminApi(request, env, url) {
     const out = items.map((t) => { const gv = verdicts.get(t.id) || {}; return { id: t.id, account: "@" + t.handle, deliver: gv.d !== false, reason: gv.r, text: (t.text || t.origText || "").slice(0, 80) }; });
     return Response.json({ ok: true, geminiReachable: reachable, probeError: probeErr, mode, tested: out.length, deliver: out.filter((v) => v.deliver).length, drop: out.filter((v) => !v.deliver).length, verdicts: out });
   }
+  if (path === "/admin/api/translate-test") {
+    // Production-context probe of BOTH translation rails on a Hebrew sample (2026-09-06 "(untranslated)" storm).
+    const sample = "\u05de\u05d8\u05d5\u05e1 \u05d0\u05de\u05d6\u05d5\u05df \u05d4\u05ea\u05e8\u05d5\u05e7\u05e7 \u05d1\u05de\u05d9\u05d0\u05de\u05d9";
+    const t0 = Date.now();
+    GTX_DEAD_UNTIL = 0; // force-probe gtx even if dead-cached
+    const gx = await translateGtx(sample);
+    const t1 = Date.now();
+    const gm = await translateGemini(env, sample);
+    const t2 = Date.now();
+    return Response.json({ ok: true, sample,
+      gtx: { result: gx, ms: t1 - t0, deadCachedUntil: GTX_DEAD_UNTIL || null },
+      gemini: { result: gm, ms: t2 - t1 },
+      detectionOnEnglish: hasNonEnglish("Breaking: plane crashed in Miami, officials say") });
+  }
+
   if (path === "/admin/api/admin-key") {
     const configured = (await env.BUFF_KV.get("admin_key")) || env.ADMIN_SECRET;
     if (body.current !== configured) return Response.json({ error: "current key wrong" }, { status: 403 });
