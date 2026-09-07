@@ -669,16 +669,25 @@ async function poll(env, maxDeliver, diag) {
   // Stop paging as soon as the scan hits a seen item (normal case: 1 page), cap 4 pages to bound tick wall-time.
   const ids = [];
   const idSet = new Set();
-  let raw = "", cursor = null, pages = 0, rawBytes = 0;
+  const raws = []; // v35: keep every page's raw - byId must cover ALL collected ids, not just the last page's (page-1 posts were silently dropped on heavy multi-page ticks)
+  let cursor = null, pages = 0, rawBytes = 0;
   while (pages < 4) {
-    raw = await fetchListTimeline(env, cursor);
+    const raw = await fetchListTimeline(env, cursor);
     rawBytes += raw.length;
     pages++;
-    const pageIds = [...raw.matchAll(/"entryId":"tweet-(\d+)"/g)].map((m) => m[1]).filter((x) => !idSet.has(x));
-    for (const x of pageIds) { idSet.add(x); ids.push(x); }
-    if (pageIds.some((x) => bsSeenHasFast(x))) break; // reached known territory - no need to page deeper
+    raws.push(raw);
+    let sawSeen = false, found = 0; // v35: single-pass id scan, no intermediate match arrays (per-tick CPU trim)
+    const re = /"entryId":"tweet-(\d+)"/g;
+    let mm;
+    while ((mm = re.exec(raw)) !== null) {
+      const x = mm[1];
+      if (idSet.has(x)) continue;
+      idSet.add(x); ids.push(x); found++;
+      if (bsSeenHasFast(x)) sawSeen = true;
+    }
+    if (sawSeen) break; // reached known territory - no need to page deeper
     const cm = raw.match(/"value":"([^"]+)","cursorType":"Bottom"/);
-    if (!cm || !pageIds.length) break;
+    if (!cm || !found) break;
     cursor = cm[1];
   }
   if (d) { d.rawBytes = rawBytes; d.pages = pages; mark("tFetch"); }
@@ -717,9 +726,9 @@ async function poll(env, maxDeliver, diag) {
 
   if (!unseen.length) return `delivered=0 dropped=0 skipped=${skipped} filtered=0 deferred=0${paused ? " paused" : ""}${waDown ? " wa_down" : ""} scan-quiet`;
 
-  const payload = JSON.parse(raw);
+  const tweets = []; // v35: parse every fetched page so multi-page ticks don't lose earlier-page posts
+  for (const r of raws) { try { tweets.push(...extractTweets(JSON.parse(r))); } catch (e) {} }
   mark("tParse");
-  const tweets = extractTweets(payload);
   if (d) d.tweets = tweets.length;
   mark("tExtract");
   const byId = new Map(tweets.map((t) => [t.id, t]));
@@ -1160,6 +1169,8 @@ async function geminiClassify(env, key, rules, mode, tweets, acctRules, recent) 
       (recent && recent.length ? "ALREADY DELIVERED to the user in the last few hours (each line = one delivered post):\n- " + recent.slice(-40).join("\n- ") + "\nDrop any post that restates facts already delivered above unless it carries MATERIALLY NEW information (new casualty toll, official finding, genuinely new footage/angle, new location or development). A different outlet repeating the same facts is a DROP.\n" : "") +
       "Posts:\n" + JSON.stringify(brief) + "\n" +
       "Reply with ONLY a JSON array like [{\"id\":\"...\",\"deliver\":true,\"reason\":\"one short line\"}] covering every post id. Reason: max 12 words, plain. No other prose.";
+    const cool = await env.BUFF_KV.get("gemini_cooldown"); // v35c: quota backoff - don't hammer a 429ing project
+    if (cool && Date.now() < Number(cool)) return null;
     const res = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
       method: "POST",
       headers: { "content-type": "application/json", "x-goog-api-key": key },
@@ -1171,18 +1182,41 @@ async function geminiClassify(env, key, rules, mode, tweets, acctRules, recent) 
       }),
       signal: AbortSignal.timeout(20000),
     });
-    if (!res.ok) return null; // v34 fail-closed: caller holds unjudged posts
+    if (!res.ok) { // v35b: surface the failure reason - fail-closed silence is invisible without it
+      if (res.status === 429) { try { await kvPut(env, "gemini_cooldown", String(Date.now() + 5 * 60000), { expirationTtl: 600 }); } catch (e0) {} } // v35c: 5-min classify backoff
+      try {
+        const eb = (await res.text()).slice(0, 300);
+        const msg = `${new Date().toISOString()} gemini classify HTTP ${res.status}: ${eb}`;
+        const prev = await env.BUFF_KV.get("last_error");
+        if (!prev || prev.slice(24) !== msg.slice(24)) await kvPut(env, "last_error", msg);
+      } catch (e0) {}
+      return null; // v34 fail-closed: caller holds unjudged posts
+    }
     const data = await res.json();
     let txt = (data.steps || []).filter((st) => st && st.type === "model_output").flatMap((st) => st.content || []).filter((c) => c && c.type === "text").map((c) => c.text || "").join("");
     const start = txt.indexOf("["), end = txt.lastIndexOf("]");
-    if (start < 0 || end <= start) return null; // v34 fail-closed
+    if (start < 0 || end <= start) { // v35b: unparseable/blocked output - record a snippet
+      try {
+        const msg = `${new Date().toISOString()} gemini classify unparseable output: ${txt.slice(0, 100) || "(empty)"}`;
+        const prev = await env.BUFF_KV.get("last_error");
+        if (!prev || prev.slice(24) !== msg.slice(24)) await kvPut(env, "last_error", msg);
+      } catch (e0) {}
+      return null; // v34 fail-closed
+    }
     const arr = JSON.parse(txt.slice(start, end + 1));
     for (const v of arr) if (v && v.id && typeof v.deliver === "boolean") verdicts.set(String(v.id), { d: v.deliver, r: typeof v.reason === "string" ? v.reason.slice(0, 140) : undefined });
     const day = new Date().toISOString().slice(0, 10);
     const bsU = await loadBS(env);
     if (!bsU.gemCalls || bsU.gemCalls.day !== day) bsU.gemCalls = { day, n: 0 };
     bsU.gemCalls.n++; bsU.dirty = true;
-  } catch (e) { return null; /* v34 fail-closed */ }
+  } catch (e) { // v35b: log the exception
+    try {
+      const msg = `${new Date().toISOString()} gemini classify throw: ${String((e && e.message) || e).slice(0, 140)}`;
+      const prev = await env.BUFF_KV.get("last_error");
+      if (!prev || prev.slice(24) !== msg.slice(24)) await kvPut(env, "last_error", msg);
+    } catch (e0) {}
+    return null; /* v34 fail-closed */
+  }
   return verdicts;
 }
 
