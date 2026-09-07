@@ -59,9 +59,10 @@ async function getXSession(env) {
   return { auth_token: env.X_AUTH_TOKEN || "", ct0: env.X_CT0 || "" };
 }
 
-async function fetchListTimeline(env) {
+async function fetchListTimeline(env, cursor) {
   const sess = await getXSession(env);
   const vars = { listId: env.X_LIST_ID, count: 20 };
+  if (cursor) vars.cursor = cursor;
   const url = `https://x.com/i/api/graphql/${QID_LIST}/ListLatestTweetsTimeline?variables=${encodeURIComponent(JSON.stringify(vars))}&features=${encodeURIComponent(JSON.stringify(X_FEATURES))}`;
   const res = await fetch(url, {
     headers: {
@@ -662,12 +663,28 @@ async function poll(env, maxDeliver, diag) {
   const mark = (k) => { if (d) d[k] = Date.now() - d._t0; };
   if (d) d._t0 = Date.now();
   if (!env.X_LIST_ID) return "no list id - skipping";
-  const raw = await fetchListTimeline(env);
-  if (d) { d.rawBytes = raw.length; mark("tFetch"); }
-  const ids = [...new Set([...raw.matchAll(/"entryId":"tweet-(\d+)"/g)].map((m) => m[1]))];
+  const bsPre = await loadBS(env);
+  const bsSeenHasFast = (x) => bsPre.seenSet.has(x);
+  // v33: paginate the list timeline so heavy news days can't bury sparse accounts (pizza index gap 2026-09-06).
+  // Stop paging as soon as the scan hits a seen item (normal case: 1 page), cap 4 pages to bound tick wall-time.
+  const ids = [];
+  const idSet = new Set();
+  let raw = "", cursor = null, pages = 0, rawBytes = 0;
+  while (pages < 4) {
+    raw = await fetchListTimeline(env, cursor);
+    rawBytes += raw.length;
+    pages++;
+    const pageIds = [...raw.matchAll(/"entryId":"tweet-(\d+)"/g)].map((m) => m[1]).filter((x) => !idSet.has(x));
+    for (const x of pageIds) { idSet.add(x); ids.push(x); }
+    if (pageIds.some((x) => bsSeenHasFast(x))) break; // reached known territory - no need to page deeper
+    const cm = raw.match(/"value":"([^"]+)","cursorType":"Bottom"/);
+    if (!cm || !pageIds.length) break;
+    cursor = cm[1];
+  }
+  if (d) { d.rawBytes = rawBytes; d.pages = pages; mark("tFetch"); }
   if (!ids.length) return "timeline empty";
 
-  const bs = await loadBS(env);
+  const bs = bsPre;
   if (!bs.born) {
     // v29 bootstrap: fresh state blob - mark the whole current timeline seen, deliver nothing (resume from NOW, never a backlog dump)
     bs.born = Date.now();
