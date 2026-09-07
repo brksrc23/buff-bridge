@@ -1253,7 +1253,12 @@ async function geminiClassify(env, key, rules, mode, tweets, acctRules, recent) 
       return null; // v34 fail-closed
     }
     const arr = JSON.parse(txt.slice(start, end + 1));
-    for (const v of arr) if (v && v.id && typeof v.deliver === "boolean") verdicts.set(String(v.id), { d: v.deliver, r: typeof v.reason === "string" ? v.reason.slice(0, 140) : undefined });
+    const covered = new Set();
+    for (const v of arr) if (v && v.id && typeof v.deliver === "boolean") { verdicts.set(String(v.id), { d: v.deliver, r: typeof v.reason === "string" ? v.reason.slice(0, 140) : undefined }); covered.add(String(v.id)); }
+    // v40 (2026-09-07): the map defaults every candidate to deliver:true - any id Gemini's array skipped would be
+    // cached as PASS and delivered UNFILTERED (the fail-open hole inside fail-closed; root cause of off-class
+    // deliveries like the WSJ jazz album). Uncovered ids are removed -> held and retried next tick instead.
+    for (const vid of [...verdicts.keys()]) if (!covered.has(vid)) verdicts.delete(vid);
     const day = new Date().toISOString().slice(0, 10);
     const bsU = await loadBS(env);
     if (!bsU.gemCalls || bsU.gemCalls.day !== day) bsU.gemCalls = { day, n: 0 };
