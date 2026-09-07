@@ -1198,7 +1198,7 @@ async function geminiClassify(env, key, rules, mode, tweets, acctRules, recent) 
     if (!res.ok) { // v35b: surface the failure reason - fail-closed silence is invisible without it
       if (res.status === 429) { try { await kvPut(env, "gemini_cooldown", String(Date.now() + 5 * 60000), { expirationTtl: 600 }); } catch (e0) {} } // v35c: 5-min classify backoff
       try {
-        const eb = (await res.text()).slice(0, 300);
+        const eb = (await res.text()).slice(0, 500); // v36b: enough to capture the quota metric name
         const msg = `${new Date().toISOString()} gemini classify HTTP ${res.status}: ${eb}`;
         const prev = await env.BUFF_KV.get("last_error");
         if (!prev || prev.slice(24) !== msg.slice(24)) await kvPut(env, "last_error", msg);
