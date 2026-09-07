@@ -382,5 +382,30 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`buff-bridge listening on http://${HOST}:${PORT} - recipient ${RECIPIENT}`);
 });
+
+// Worker poller (2026-09-07): Cloudflare's free plan enforces its 10ms CPU limit on a rolling average, and cron
+// invocations lose burst tolerance first - twice tonight the scheduler was throttled dark while HTTP /poll-now
+// kept working. So poll over HTTP every 90s as a second engine. Overlap with cron is safe: the worker marks
+// seen only after a successful send and our transport dedupe catches any residual double-fire. Each poll makes
+// the worker ping our /health, which also keeps this free-tier instance warm when cron is dead. The worker
+// honors the full-off Shabbos window and the power switch itself suspends this service, so both stay absolute.
+let pollInFlight = false;
+async function pollWorker() {
+  if (!WORKER_URL || !SECRET || pollInFlight) return;
+  pollInFlight = true;
+  try {
+    const r = await fetch(WORKER_URL + '/poll-now?key=' + encodeURIComponent(SECRET), { signal: AbortSignal.timeout(60000) });
+    const j = await r.json().catch(() => null);
+    const result = (j && j.result) || ('HTTP ' + r.status);
+    if (!/^delivered=0 dropped=0/.test(result)) console.log('worker poll:', result); // quiet ticks stay quiet in the logs
+  } catch (e) {
+    console.error('worker poll failed:', String((e && e.message) || e));
+  } finally {
+    pollInFlight = false;
+  }
+}
+setTimeout(pollWorker, 30000); // let the WhatsApp connection settle first
+setInterval(pollWorker, 90000);
+
 await initDedup();
 await start();
