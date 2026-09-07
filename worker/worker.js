@@ -756,6 +756,7 @@ async function poll(env, maxDeliver, diag) {
   let delivered = 0, dropped = 0, deferred = 0, filtered = 0, suppressed = 0, untranslated = 0;
   // Gemini gatekeeper: batch-classify this tick's delivery candidates (max 10/tick, cached per tweet). FAIL-OPEN.
   const feedMode = await getMode(env);
+  const acctRules = (!holding && feedMode !== "everything") ? await getAcctRules(env) : {};
   if (!holding && feedMode !== "everything") {
     const gemKey = await getGeminiKey(env);
     if (gemKey) {
@@ -767,6 +768,7 @@ async function poll(env, maxDeliver, diag) {
         if (!t) continue;
         if (t.replyToUserId && t.authorId && t.replyToUserId !== t.authorId) continue;
         if (!passesFilters(t, filters)) continue;
+        if (isAlwaysDeliver(t.handle, acctRules)) continue; // v34: bypass accounts never classified
         pre.push(t);
         if (pre.length >= cap * 2) break;
       }
@@ -779,9 +781,9 @@ async function poll(env, maxDeliver, diag) {
       if (d) d.candidates = candidates.length;
       mark("tPreClassify");
       if (candidates.length) {
-        const verdicts = await geminiClassify(env, gemKey, rules, feedMode, candidates, await getAcctRules(env), (bs.recentDel || []).map((x) => x.t));
+        const verdicts = await geminiClassify(env, gemKey, rules, feedMode, candidates, acctRules, (bs.recentDel || []).map((x) => x.t));
         mark("tClassify");
-        for (const [vid, gv] of verdicts) bsGemSet(bs, vid, gv);
+        if (verdicts) for (const [vid, gv] of verdicts) bsGemSet(bs, vid, gv); // null = Gemini unreachable: hold candidates, retry next tick
       }
     }
   }
@@ -808,8 +810,9 @@ async function poll(env, maxDeliver, diag) {
       filtered++;
       continue;
     }
-    if (!holding && feedMode !== "everything") {
+    if (!holding && feedMode !== "everything" && !isAlwaysDeliver(t.handle, acctRules)) {
       const gv = parseGem(bsGemGet(bs, id) ? JSON.stringify(bsGemGet(bs, id)) : null);
+      if (!gv && feedMode === "breaking") continue; // v34 fail-closed: unjudged stays unseen, retried next tick - quiet over noisy (Ezra 2026-09-06)
       if (gv && gv.d === false) { // gatekeeper dropped it: retain for queries, never deliver
         retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now() });
         bsSeenAdd(bs, id);
@@ -1124,6 +1127,7 @@ const DEFAULT_ACCT_RULES = {
   nypost: "Deliver ONLY hard national breaking news: major crime with national significance, politics/government, national emergencies. Drop tabloid, celebrity, sports, lifestyle, and outrage-bait content entirely.",
 };
 const getAcctRules = async (env) => ({ ...DEFAULT_ACCT_RULES, ...(await getJSON(env, "acct_rules", {})) }); // KV overrides win; defaults ship in code
+const isAlwaysDeliver = (handle, acctRules) => { const r = (acctRules || {})[(handle || "").toLowerCase()]; return !!r && /^\s*always deliver/i.test(r); }; // v34: true bypass - never gated by Gemini
 const getGeminiKey = async (env) => env.GEMINI_API_KEY || (await env.BUFF_KV.get("gemini_key")) || null;
 
 // Classify a batch of candidate posts. FAIL-OPEN: any error, timeout, or malformed answer -> deliver everything.
@@ -1167,18 +1171,18 @@ async function geminiClassify(env, key, rules, mode, tweets, acctRules, recent) 
       }),
       signal: AbortSignal.timeout(20000),
     });
-    if (!res.ok) return verdicts; // fail open
+    if (!res.ok) return null; // v34 fail-closed: caller holds unjudged posts
     const data = await res.json();
     let txt = (data.steps || []).filter((st) => st && st.type === "model_output").flatMap((st) => st.content || []).filter((c) => c && c.type === "text").map((c) => c.text || "").join("");
     const start = txt.indexOf("["), end = txt.lastIndexOf("]");
-    if (start < 0 || end <= start) return verdicts; // fail open
+    if (start < 0 || end <= start) return null; // v34 fail-closed
     const arr = JSON.parse(txt.slice(start, end + 1));
     for (const v of arr) if (v && v.id && typeof v.deliver === "boolean") verdicts.set(String(v.id), { d: v.deliver, r: typeof v.reason === "string" ? v.reason.slice(0, 140) : undefined });
     const day = new Date().toISOString().slice(0, 10);
     const bsU = await loadBS(env);
     if (!bsU.gemCalls || bsU.gemCalls.day !== day) bsU.gemCalls = { day, n: 0 };
     bsU.gemCalls.n++; bsU.dirty = true;
-  } catch (e) { /* fail open */ }
+  } catch (e) { return null; /* v34 fail-closed */ }
   return verdicts;
 }
 
@@ -1502,6 +1506,7 @@ async function handleAdminApi(request, env, url) {
       if (!probe.ok) probeErr = "HTTP " + probe.status;
     } catch (e) { probeErr = String(e.message || e); }
     const verdicts = await geminiClassify(env, key, rules, mode, items, acctRules);
+    if (!verdicts) return Response.json({ ok: false, error: "classify failed (fail-closed contract)", geminiReachable: reachable, probeError: probeErr });
     const out = items.map((t) => { const gv = verdicts.get(t.id) || {}; return { id: t.id, account: "@" + t.handle, deliver: gv.d !== false, reason: gv.r, text: (t.text || t.origText || "").slice(0, 80) }; });
     return Response.json({ ok: true, geminiReachable: reachable, probeError: probeErr, mode, tested: out.length, deliver: out.filter((v) => v.deliver).length, drop: out.filter((v) => !v.deliver).length, verdicts: out });
   }
