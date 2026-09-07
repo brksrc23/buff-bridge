@@ -124,8 +124,16 @@ async function start() {
         if (!msg.message || msg.key.fromMe) continue;
         const from = (msg.key.remoteJid || '').replace(/@.*/, '');
         if (!/^\d+$/.test(from)) continue; // ignore groups/status
-        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
-        if (!text.trim()) continue;
+        // unwrap containers: disappearing msgs, view-once, edits, caption wrappers (2026-09-06: typed commands were silently skipped)
+        let mm = msg.message;
+        for (let i = 0; i < 4; i++) {
+          const inner = mm.ephemeralMessage?.message || mm.viewOnceMessage?.message || mm.viewOnceMessageV2?.message || mm.documentWithCaptionMessage?.message || mm.editedMessage?.message?.protocolMessage?.editedMessage;
+          if (!inner) break;
+          mm = inner;
+        }
+        const text = mm.conversation || mm.extendedTextMessage?.text || mm.imageMessage?.caption || mm.videoMessage?.caption || '';
+        if (!text.trim()) { console.log('incoming skip (no text):', from, 'types=' + Object.keys(mm).join(',')); continue; }
+        console.log('incoming fwd:', from, JSON.stringify(text.trim().slice(0, 50)));
         fetch(WORKER_URL + '/incoming', {
           method: 'POST',
           headers: { 'content-type': 'application/json', authorization: SECRET },
