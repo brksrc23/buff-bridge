@@ -1678,6 +1678,21 @@ export default {
             await env.BUFF_KV.delete("shabbos_digest_pending");
           }
         } catch (e) {}
+        // v38 single-poller lease (2026-09-07): the bridge poller (90s) is the primary engine; cron polls only
+        // when the poller is stale (>150s) or the bridge is unreachable. Kills the cross-engine re-classification
+        // that was doubling Gemini burn and double-processing ~35% of posts. Lease rides the bridge /status fetch -
+        // zero extra KV writes (a KV lease at poll cadence alone would exceed the 1k/day free write budget).
+        try {
+          const stR = await fetch(env.BRIDGE_URL + "/status", { headers: { authorization: env.BRIDGE_SECRET }, signal: AbortSignal.timeout(4000) });
+          const stJ = await stR.json();
+          const age = stJ && stJ.workerPoll && stJ.workerPoll.ageSec;
+          if (typeof age === "number" && age < 150) {
+            bs.lastPoll = `${new Date().toISOString()} tick-skip (poller active, ${age}s)`;
+            bs.dirty = true;
+            await saveBS(env, bs, false);
+            return;
+          }
+        } catch (e) {} // any error -> poll as today (fail toward freshness)
         try {
           bs.lastPoll = `${new Date().toISOString()} tick`;
           bs.dirty = true;
@@ -1723,7 +1738,7 @@ export default {
         // v37b: the bridge-side poller (cron-throttle fallback) calls this around the clock - it must not wake
         // the feed during a full-off Shabbos window (same early-return as the cron handler; digest mode collects silently)
         if (await shabbosHoldActive(env) && (await getJSON(env, "shabbos_mode", "off")) !== "digest") return Response.json(diag ? { result: "shabbos-dark", diag } : { result: "shabbos-dark" });
-        const result = await poll(env, undefined, diag);
+        const result = await poll(env, 6, diag); // v38: poller per-poll cap matches cron - drains dribble, never dump
         return Response.json(diag ? { result, diag } : { result });
       } catch (e) {
         return Response.json({ error: String(e && e.message || e), diag }, { status: 500 });
