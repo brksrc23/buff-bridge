@@ -871,7 +871,8 @@ async function poll(env, maxDeliver, diag) {
       if (d) d.candidates = candidates.length;
       mark("tPreClassify");
       if (candidates.length) {
-        const verdicts = await geminiClassify(env, gemKey, rules, feedMode, candidates, acctRules, (bs.recentDel || []).map((x) => x.t));
+        let verdicts = await geminiClassify(env, gemKey, rules, feedMode, candidates, acctRules, (bs.recentDel || []).map((x) => x.t));
+        if (!verdicts) verdicts = await waiClassify(env, rules, feedMode, candidates, acctRules, (bs.recentDel || []).map((x) => x.t)); // v42: Workers AI net, only when Gemini is out
         mark("tClassify");
         if (verdicts) for (const [vid, gv] of verdicts) bsGemSet(bs, vid, gv); // null = Gemini unreachable: hold candidates, retry next tick
       }
@@ -1228,6 +1229,38 @@ function parseGem(v) {
   if (v === "1") return { d: true };
   if (v === "0") return { d: false };
   try { const j = JSON.parse(v); return j && typeof j.d === "boolean" ? j : null; } catch (e) { return null; }
+}
+
+// v43: fallback judge = separate worker buff-wai-judge (llama-3.3-70b-fp8-fast on Workers AI free tier).
+// The account API silently drops an "ai" binding on THIS script, so the model runs in its own worker and the
+// main worker calls it over HTTPS with a shared secret. Engages ONLY when Gemini is unreachable. Same rules,
+// same verdict shape; judge returns covered-ids only. Returns null when unavailable -> caller holds (fail-closed).
+async function waiClassify(env, rules, mode, tweets, acctRules, recent) {
+  try {
+    if (!env.BRIDGE_SECRET || !env.BRIDGE_URL) return null;
+    // Route via the Render bridge: same-account workers.dev subrequests from this worker are blocked (404/1042),
+    // and the API token silently drops service/ai bindings on this script. Bridge -> judge is an external hop.
+    const res = await fetch(env.BRIDGE_URL.replace(/\/$/, "") + "/judge", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: env.BRIDGE_SECRET },
+      body: JSON.stringify({ rules, mode, tweets, acctRules, recent }),
+      signal: AbortSignal.timeout(50000),
+    });
+    if (!res.ok) { try { const msg = `${new Date().toISOString()} workers-ai judge HTTP ${res.status}`; const prev = await env.BUFF_KV.get("last_error"); if (!prev || prev.slice(24) !== msg.slice(24)) await kvPut(env, "last_error", msg); } catch (e0) {} return null; }
+    const j = await res.json();
+    if (!j || !Array.isArray(j.verdicts) || !j.verdicts.length) return null;
+    const verdicts = new Map();
+    for (const pair of j.verdicts) if (Array.isArray(pair) && pair[0] != null && pair[1] && typeof pair[1].d === "boolean") verdicts.set(String(pair[0]), { d: pair[1].d, r: "wai" });
+    if (!verdicts.size) return null;
+    const day = new Date().toISOString().slice(0, 10);
+    const bsU = await loadBS(env);
+    if (!bsU.waiCalls || bsU.waiCalls.day !== day) bsU.waiCalls = { day, n: 0 };
+    bsU.waiCalls.n += 1; bsU.dirty = true;
+    return verdicts;
+  } catch (e) {
+    try { const msg = `${new Date().toISOString()} workers-ai judge throw: ${String((e && e.message) || e).slice(0, 120)}`; const prev = await env.BUFF_KV.get("last_error"); if (!prev || prev.slice(24) !== msg.slice(24)) await kvPut(env, "last_error", msg); } catch (e0) {}
+    return null;
+  }
 }
 
 async function geminiClassify(env, key, rules, mode, tweets, acctRules, recent) {
@@ -1801,6 +1834,10 @@ export default {
     if (url.pathname === "/poll-now" && [env.VERIFY_TOKEN, env.BRIDGE_SECRET].includes(url.searchParams.get("key"))) {
       const diag = url.searchParams.get("diag") ? {} : null;
       try {
+        if (url.searchParams.get("wai")) { // v42 probe: is the Workers AI fallback judge reachable?
+          const r = await waiClassify(env, ["Deliver only urgent breaking news about wars, disasters, or major attacks.", "When in doubt, DROP."], "breaking", [{ id: "probe1", handle: "testfeed", kind: "post", media: [], text: "Sunny skies and mild temperatures expected across the region today." }, { id: "probe2", handle: "testfeed", kind: "post", media: [], text: "BREAKING: Massive explosion reported at a port facility, multiple casualties confirmed, emergency crews responding." }], {}, []);
+          return Response.json({ waiReachable: r !== null, verdicts: r ? [...r] : null, bridgeAuthBound: !!env.BRIDGE_SECRET });
+        }
         // v37b: the bridge-side poller (cron-throttle fallback) calls this around the clock - it must not wake
         // the feed during a full-off Shabbos window (same early-return as the cron handler; digest mode collects silently)
         if (await shabbosHoldActive(env) && (await getJSON(env, "shabbos_mode", "off")) !== "digest") return Response.json(diag ? { result: "shabbos-dark", diag } : { result: "shabbos-dark" });
