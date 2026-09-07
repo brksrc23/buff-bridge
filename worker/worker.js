@@ -484,6 +484,33 @@ function isStoryDupeFp(fp, stories) {
   return false;
 }
 
+// v39 (2026-09-07, approved by Ezra via parent): same-story 2h throttle - "things that were similar".
+// A no-media follow-up matching a story DELIVERED within the last 2h is suppressed at a looser bar than
+// isStoryDupeFp, UNLESS it introduces 2+ new entity tokens (the mechanical proxy for a real new angle /
+// severity jump - those still deliver, per the standing event rule). Posts with media are never touched
+// here (media = new angle by rule; exact media dupes are handled by media memory).
+function newEntCount(fpE, storyE) {
+  let n = 0;
+  for (const w of fpE) { let found = false; for (const v of storyE) { if (tokEq(w, v)) { found = true; break; } } if (!found) n++; }
+  return n;
+}
+function isStoryThrottleFp(fp, stories) {
+  if (fp.u.size < 4) return false;
+  const now = Date.now();
+  for (const s of stories) {
+    if (now - (s.at || 0) > 2 * 3600 * 1000) continue; // throttle window: 2h from last delivery of the story
+    const uni = contSim(fp.u, new Set(s.u || []));
+    const eu = new Set(s.e || []);
+    const ent = eu.size && fp.e.size ? contSim(fp.e, eu) : null;
+    const similar = ent !== null ? (ent >= 0.5 && uni >= 0.35) : uni >= 0.5;
+    if (!similar) continue;
+    if (eu.size && newEntCount(fp.e, eu) >= 2) continue; // real new angle -> deliver
+    return true;
+  }
+  return false;
+}
+function isStoryDupeOrThrottle(fp, stories) { return isStoryDupeFp(fp, stories) || isStoryThrottleFp(fp, stories); }
+
 // ---------- media dedup ----------
 // Fingerprint media worker-side (Cloudflare egress is free; bridge->WhatsApp upload is the metered part).
 // Images: full-byte SHA-256. Videos: SHA-256 over "size + first 1MB" (memory-safe, catches identical re-uploads).
@@ -790,7 +817,7 @@ async function poll(env, maxDeliver, diag) {
         if (isAlwaysDeliver(t.handle, acctRules)) continue; // v34: bypass accounts never classified
         try { // v36: dupe of an already-delivered story with no new media -> the in-loop check would drop it anyway; skip the judge call
           const hasMedia = (t.media || []).length > 0;
-          if (!hasMedia && isStoryDupeFp(storyFp([t.text, t.origText, t.quotedText].filter(Boolean).join(" ")), stories)) {
+          if (!hasMedia && isStoryDupeOrThrottle(storyFp([t.text, t.origText, t.quotedText].filter(Boolean).join(" ")), stories)) {
             retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), storyDupe: true });
             bsSeenAdd(bs, id);
             preDupes.add(id);
@@ -862,7 +889,7 @@ async function poll(env, maxDeliver, diag) {
       try {
         const hfp = storyFp([t.text, t.origText, t.quotedText].filter(Boolean).join(" "));
         const hasMedia = (t.media || []).length > 0; // new photos/videos/angles of an event are NOT dupes (2026-09-04 Ezra); identical media is already caught by media memory
-        if (!hasMedia && isStoryDupeFp(hfp, stories)) { bsSeenAdd(bs, t.id); storyDupes++; if (++shabbosProcessed >= 15) break; continue; }
+        if (!hasMedia && isStoryDupeOrThrottle(hfp, stories)) { bsSeenAdd(bs, t.id); storyDupes++; if (++shabbosProcessed >= 15) break; continue; }
         if (hfp.u.size) stories.push({ u: [...hfp.u].slice(0, 60), e: [...hfp.e].slice(0, 40), at: Date.now() });
       } catch (e) {}
       bsSeenAdd(bs, t.id);
@@ -877,7 +904,7 @@ async function poll(env, maxDeliver, diag) {
     try {
       fp = storyFp([t.text, t.origText, t.quotedText].filter(Boolean).join(" "));
       const hasMedia = (t.media || []).length > 0; // new photos/videos/angles of an event are NOT dupes (2026-09-04 Ezra)
-      if (!hasMedia && isStoryDupeFp(fp, stories)) {
+      if (!hasMedia && isStoryDupeOrThrottle(fp, stories)) {
           retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), storyDupe: true });
           bsSeenAdd(bs, t.id);
           storyDupes++;
@@ -918,7 +945,7 @@ async function poll(env, maxDeliver, diag) {
       throw e;
     }
   }
-  bs.stories = stories.slice(-120); bs.dirty = true;
+  bs.stories = stories.slice(-200); bs.dirty = true;
   if (heldItems.length) {
     try {
       const buf = await getJSON(env, "shabbos_items", []);
