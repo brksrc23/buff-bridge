@@ -676,19 +676,27 @@ async function poll(env, maxDeliver, diag) {
     rawBytes += raw.length;
     pages++;
     raws.push(raw);
-    let sawSeen = false, found = 0; // v35: single-pass id scan, no intermediate match arrays (per-tick CPU trim)
-    const re = /"entryId":"tweet-(\d+)"/g;
-    let mm;
-    while ((mm = re.exec(raw)) !== null) {
-      const x = mm[1];
+    let sawSeen = false, found = 0, pos = 0; // v37: indexOf literal scan - the regex exec over ~1MB of timeline text was the quiet-tick CPU floor (free-plan 10ms enforcement is average-based)
+    const TOK = '"entryId":"tweet-';
+    for (;;) {
+      const i = raw.indexOf(TOK, pos);
+      if (i < 0) break;
+      const s = i + TOK.length;
+      const e = raw.indexOf('"', s);
+      if (e < 0) break;
+      const x = raw.slice(s, e);
+      pos = e + 1;
       if (idSet.has(x)) continue;
       idSet.add(x); ids.push(x); found++;
       if (bsSeenHasFast(x)) sawSeen = true;
     }
     if (sawSeen) break; // reached known territory - no need to page deeper
-    const cm = raw.match(/"value":"([^"]+)","cursorType":"Bottom"/);
-    if (!cm || !found) break;
-    cursor = cm[1];
+    const ci = raw.indexOf('"cursorType":"Bottom"'); // v37: literal cursor extraction, same shape as the old regex
+    if (ci < 0 || !found) break;
+    const vv = raw.lastIndexOf('"value":"', ci);
+    if (vv < 0) break;
+    cursor = raw.slice(vv + 9, ci - 2); // between "value":" and the closing quote before ,"cursorType"
+    if (!cursor) break;
   }
   if (d) { d.rawBytes = rawBytes; d.pages = pages; mark("tFetch"); }
   if (!ids.length) return "timeline empty";
@@ -1712,6 +1720,9 @@ export default {
     if (url.pathname === "/poll-now" && [env.VERIFY_TOKEN, env.BRIDGE_SECRET].includes(url.searchParams.get("key"))) {
       const diag = url.searchParams.get("diag") ? {} : null;
       try {
+        // v37b: the bridge-side poller (cron-throttle fallback) calls this around the clock - it must not wake
+        // the feed during a full-off Shabbos window (same early-return as the cron handler; digest mode collects silently)
+        if (await shabbosHoldActive(env) && (await getJSON(env, "shabbos_mode", "off")) !== "digest") return Response.json(diag ? { result: "shabbos-dark", diag } : { result: "shabbos-dark" });
         const result = await poll(env, undefined, diag);
         return Response.json(diag ? { result, diag } : { result });
       } catch (e) {
