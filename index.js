@@ -312,6 +312,7 @@ const server = http.createServer(async (req, res) => {
       pairingCode: registered ? null : lastPairingCode, pairingAt: lastPairingAt,
       qrAvailable: !registered && !!lastQR, qrAt: lastQRAt,
       kv: kvStatus(), dedup: dedupStatus(), user: sock?.user?.id || null,
+      workerPoll: { lastAt: lastWorkerPollAt || null, ageSec: lastWorkerPollAt ? Math.round((Date.now() - lastWorkerPollAt) / 1000) : null },
       bandwidth: { day: stats.day, bytesDay: stats.bytesDay, msgsDay: stats.msgsDay,
                    month: stats.month, bytesMonth: stats.bytesMonth, msgsMonth: stats.msgsMonth,
                    estMBMonth: +(stats.bytesMonth / 1e6).toFixed(1), note: 'estimate: media upload size + text + 1KB/msg overhead; KV flush bytes in kv.flushedBytesTotal; authoritative figure is Render dashboard > Billing' }
@@ -390,12 +391,14 @@ server.listen(PORT, HOST, () => {
 // the worker ping our /health, which also keeps this free-tier instance warm when cron is dead. The worker
 // honors the full-off Shabbos window and the power switch itself suspends this service, so both stay absolute.
 let pollInFlight = false;
+let lastWorkerPollAt = 0; // v38 single-poller lease: cron reads this via /status and only polls when we go stale
 async function pollWorker() {
   if (!WORKER_URL || !SECRET || pollInFlight) return;
   pollInFlight = true;
   try {
     const r = await fetch(WORKER_URL + '/poll-now?key=' + encodeURIComponent(SECRET), { signal: AbortSignal.timeout(60000) });
     const j = await r.json().catch(() => null);
+    if (j && typeof j.result === 'string') lastWorkerPollAt = Date.now();
     const result = (j && j.result) || ('HTTP ' + r.status);
     if (!/^delivered=0 dropped=0/.test(result)) console.log('worker poll:', result); // quiet ticks stay quiet in the logs
   } catch (e) {
