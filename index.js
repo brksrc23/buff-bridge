@@ -293,6 +293,17 @@ const server = http.createServer(async (req, res) => {
     return res.end(PAIR_HTML);
   }
   if (req.method === 'GET' && req.url === '/health') return reply(200, { ok: true, connected, registered });
+  if (req.method === 'POST' && reqUrl.pathname === '/judge') { // v4: proxy to buff-wai-judge (workers.dev same-account fetches from the main worker are blocked)
+    if (!authed) return reply(401, { error: 'bad auth' });
+    if (!process.env.JUDGE_SECRET || !process.env.JUDGE_URL) return reply(503, { error: 'judge not configured' });
+    try {
+      const bodyText = await new Promise((resolve, reject) => { let d = ''; req.on('data', (c) => { d += c; if (d.length > 200000) req.destroy(); }); req.on('end', () => resolve(d)); req.on('error', reject); });
+      const r = await fetch(process.env.JUDGE_URL, { method: 'POST', headers: { 'content-type': 'application/json', 'x-judge-key': process.env.JUDGE_SECRET }, body: bodyText, signal: AbortSignal.timeout(45000) });
+      const out = await r.text();
+      res.writeHead(r.status, { 'content-type': 'application/json' });
+      return res.end(out);
+    } catch (e) { return reply(502, { error: String(e && e.message || e).slice(0, 150) }); }
+  }
   if (req.method === 'GET' && reqUrl.pathname === '/ephemeral') {
     const key = reqUrl.searchParams.get('key') || '';
     if (!PAIR_KEY || key !== PAIR_KEY) return reply(401, { error: 'bad key' });
