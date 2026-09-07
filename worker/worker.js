@@ -764,20 +764,32 @@ async function poll(env, maxDeliver, diag) {
 
   let delivered = 0, dropped = 0, deferred = 0, filtered = 0, suppressed = 0, untranslated = 0;
   // Gemini gatekeeper: batch-classify this tick's delivery candidates (max 10/tick, cached per tweet). FAIL-OPEN.
+  let preDupes = null; // v36
   const feedMode = await getMode(env);
   const acctRules = (!holding && feedMode !== "everything") ? await getAcctRules(env) : {};
   if (!holding && feedMode !== "everything") {
     const gemKey = await getGeminiKey(env);
     if (gemKey) {
       const rules = await getRules(env);
-      const cap = shabbos ? 15 : 10; // during the hold, classify only what this tick will process - keeps tick wall-time bounded
+      const cap = shabbos ? 15 : 15; // v36: 15/batch - fewer Gemini calls/day; during the hold, classify only what this tick will process
       const pre = [];
+      preDupes = new Set(); // v36: story-dupes resolved BEFORE classify - same check as in-loop, zero Gemini spend
       for (const id of [...unseen].reverse()) {
         const t = byId.get(id);
         if (!t) continue;
         if (t.replyToUserId && t.authorId && t.replyToUserId !== t.authorId) continue;
         if (!passesFilters(t, filters)) continue;
         if (isAlwaysDeliver(t.handle, acctRules)) continue; // v34: bypass accounts never classified
+        try { // v36: dupe of an already-delivered story with no new media -> the in-loop check would drop it anyway; skip the judge call
+          const hasMedia = (t.media || []).length > 0;
+          if (!hasMedia && isStoryDupeFp(storyFp([t.text, t.origText, t.quotedText].filter(Boolean).join(" ")), stories)) {
+            retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), storyDupe: true });
+            bsSeenAdd(bs, id);
+            preDupes.add(id);
+            storyDupes++;
+            continue;
+          }
+        } catch (e) {}
         pre.push(t);
         if (pre.length >= cap * 2) break;
       }
@@ -801,6 +813,7 @@ async function poll(env, maxDeliver, diag) {
     if (shabbos && ++looped > 30) break; // bound total per-tick work during the hold; remainder stays unseen for next tick
     const t = byId.get(id);
     if (!t) continue;
+    if (preDupes && preDupes.has(id)) continue; // v36: resolved pre-classify
     if (resumeCutoff && snowMs(id) < resumeCutoff) { // posted inside the Shabbos full-off window: keep for queries, never deliver
       retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), windowSkipped: true });
       bsSeenAdd(bs, id);
@@ -1178,7 +1191,7 @@ async function geminiClassify(env, key, rules, mode, tweets, acctRules, recent) 
         model: GEMINI_MODEL,
         input: prompt,
         store: false,
-        generation_config: { temperature: 0, max_output_tokens: 1400, thinking_level: "minimal" },
+        generation_config: { temperature: 0, max_output_tokens: 2600, thinking_level: "minimal" }, // v36: sized for 15-post batches
       }),
       signal: AbortSignal.timeout(20000),
     });
@@ -1196,6 +1209,7 @@ async function geminiClassify(env, key, rules, mode, tweets, acctRules, recent) 
     let txt = (data.steps || []).filter((st) => st && st.type === "model_output").flatMap((st) => st.content || []).filter((c) => c && c.type === "text").map((c) => c.text || "").join("");
     const start = txt.indexOf("["), end = txt.lastIndexOf("]");
     if (start < 0 || end <= start) { // v35b: unparseable/blocked output - record a snippet
+      try { await kvPut(env, "gemini_cooldown", String(Date.now() + 2 * 60000), { expirationTtl: 600 }); } catch (e0) {} // v36: don't retry-storm a bad batch
       try {
         const msg = `${new Date().toISOString()} gemini classify unparseable output: ${txt.slice(0, 100) || "(empty)"}`;
         const prev = await env.BUFF_KV.get("last_error");
