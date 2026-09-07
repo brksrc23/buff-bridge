@@ -394,19 +394,37 @@ async function getSubscribers(env) {
   try { return JSON.parse((await env.BUFF_KV.get("subscribers")) || "[]"); } catch (e) { return []; }
 }
 
+// v41: returns { id, mediaDupe } so caption-folding can tell when the bridge perceptually suppressed
+// the caption's carrier media and move the caption on. Other callers keep using bridgeSend directly.
+async function bridgeSendFull(env, payload, to) {
+  const res = await fetch(`${env.BRIDGE_URL}/send`, {
+    method: "POST",
+    headers: { authorization: env.BRIDGE_SECRET, "content-type": "application/json" },
+    body: JSON.stringify({ ...payload, to }),
+    signal: AbortSignal.timeout(20000)
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(`bridge send HTTP ${res.status}: ${json.error || "?"}`);
+    err.bridgeDown = res.status === 503;
+    throw err;
+  }
+  return json || {};
+}
 async function deliverToAll(env, payload) {
   // fan out to admin + subscribers who haven't paused themselves
   const subs = await getSubscribers(env);
   const targets = [String(env.ADMIN_PHONE).replace(/\D/g, "")];
   for (const s of subs) if (!s.paused && !targets.includes(s.phone)) targets.push(s.phone);
-  let firstId = null;
+  let firstId = null, mediaDupe = false;
   for (const to of targets) {
-    const id = await bridgeSend(env, payload, to);
-    if (id) bsSentAdd(await loadBS(env), to, id); // Plan B auto-clear: blob-logged, purged 24h later by bsPurgeSent
-    if (!firstId) firstId = id;
+    const r = await bridgeSendFull(env, payload, to);
+    if (r.id) bsSentAdd(await loadBS(env), to, r.id); // Plan B auto-clear: blob-logged, purged 24h later by bsPurgeSent
+    if (r.suppressed === "media-dupe") mediaDupe = true;
+    if (!firstId) firstId = r.id;
     await sleep(250);
   }
-  return firstId;
+  return { id: firstId, mediaDupe };
 }
 
 
@@ -539,13 +557,18 @@ async function mediaFingerprint(m) {
 }
 
 async function deliverTweet(env, t) {
-  // media first (no captions), then the labeled text message.
+  // v41 caption-folding (approved 2026-09-07 11:34): the post text rides the FIRST media the bridge accepts
+  // as its caption, instead of a separate text message (~40% fewer messages; Ezra's "200 messages" complaint).
+  // WhatsApp rejects captions >1024 chars, so bodies >1000 chars keep the old separate-text behavior.
+  // If the bridge perceptually suppresses the carrier media, the caption moves to the next media; if no
+  // media carries it (or the post has none), the text sends standalone exactly as before.
   // Returns { suppressed, untranslated }: media suppressed as exact duplicates; untranslated=1 when the post
   // was DROPPED because it needed translation and both rails failed (nothing delivered, media included).
   const body = await formatBody(env, t);
   if (body === null) return { suppressed: 0, untranslated: 1 };
   let suppressed = 0;
   const dedupOff = !!(await env.BUFF_KV.get("dedup_off"));
+  const toSend = [];
   for (const m of t.media) {
     const fp = dedupOff ? null : await mediaFingerprint(m);
     if (fp) {
@@ -553,10 +576,18 @@ async function deliverTweet(env, t) {
       if (bsMediaHas(bsM, fp)) { suppressed++; continue; } // exact media already sent (boilerplate logos, cross-account re-uploads) - suppress, text+link still goes
       bsMediaSet(bsM, fp);
     }
-    await deliverToAll(env, m.kind === "image" ? { imageUrl: m.url } : { videoUrl: m.url });
+    toSend.push(m);
+  }
+  const fold = body.length <= 1000;
+  let caption = fold ? body : null;
+  for (const m of toSend) {
+    const payload = m.kind === "image" ? { imageUrl: m.url } : { videoUrl: m.url };
+    if (caption) payload.text = caption;
+    const r = await deliverToAll(env, payload);
+    if (caption && !(r && r.mediaDupe)) caption = null;
     await sleep(250);
   }
-  await deliverToAll(env, { text: body });
+  if (caption || !fold) await deliverToAll(env, { text: body });
   return { suppressed, untranslated: 0 };
 }
 
@@ -588,6 +619,9 @@ async function loadBS(env) {
   let d = null;
   try { d = JSON.parse((await env.BUFF_KV.get(BS_KEY)) || "null"); } catch (e) {}
   if (!d || d.v !== 1) d = { v: 1, born: 0, seen: [], gem: {}, media: {}, sent: [], stories: [], vol: null, gemCalls: null, lastPoll: null, lastDone: null, savedAt: 0, recentDel: [] };
+  // v41 one-time purge: the pre-v40 verdict cache is poisoned with default-true entries (uncovered ids Gemini
+  // skipped were cached as PASS). Wipe once per isolate on first load post-deploy; legit backlog re-classifies.
+  if (d.gemPurgedV41 !== true) { d.gem = {}; d.gemPurgedV41 = true; d.dirty = true; }
   d.dirty = false;
   d.seenSet = new Set(d.seen);
   BS_CACHE = d;
