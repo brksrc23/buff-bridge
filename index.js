@@ -236,8 +236,10 @@ async function ephemeralFor(jid) {
 async function sendToRecipient({ text, imageUrl, videoUrl, quoteId, to }) {
   const jid = ((to || RECIPIENT) + '').replace(/\D/g, '') + '@s.whatsapp.net';
   let content;
-  if (imageUrl) content = { image: { url: imageUrl } };
-  else if (videoUrl) content = { video: { url: videoUrl } };
+  // v3 caption-folding: a text field alongside media becomes the media's caption (worker folds post text
+  // onto the first accepted media to cut message count ~40%). Text-only sends unchanged.
+  if (imageUrl) content = { image: { url: imageUrl }, ...(text ? { caption: text } : {}) };
+  else if (videoUrl) content = { video: { url: videoUrl }, ...(text ? { caption: text } : {}) };
   else if (text) content = { text };
   else throw new Error('body needs one of: text, imageUrl, videoUrl');
 
