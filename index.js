@@ -79,8 +79,17 @@ function persistStats() {
 async function estimateOutboundBytes(payload) {
   let bytes = 1024; // WA protocol overhead per message
   if (payload.text) bytes += Buffer.byteLength(payload.text);
+  const mediaList = Array.isArray(payload.mediaUrls) && payload.mediaUrls.length ? payload.mediaUrls : null;
   const media = payload.imageUrl || payload.videoUrl;
-  if (media) {
+  if (mediaList) {
+    for (const m of mediaList) {
+      try {
+        const r = await fetch(m.url, { method: 'HEAD', signal: AbortSignal.timeout(4000) });
+        const len = parseInt(r.headers.get('content-length') || '0', 10);
+        bytes += len > 0 ? len : 500000;
+      } catch { bytes += 500000; }
+    }
+  } else if (media) {
     try {
       const r = await fetch(media, { method: 'HEAD', signal: AbortSignal.timeout(4000) });
       const len = parseInt(r.headers.get('content-length') || '0', 10);
@@ -233,9 +242,44 @@ async function ephemeralFor(jid) {
   return duration;
 }
 
-async function sendToRecipient({ text, imageUrl, videoUrl, quoteId, to }) {
+// v7: WhatsApp album send (Baileys rc14 native): one album container message + each media
+// associated via albumParentKey. Renders as ONE grouped album in the chat instead of N bubbles.
+async function sendAlbum(jid, text, items, opts) {
+  const imgs = items.filter((i) => i.kind === 'image').length;
+  const vids = items.length - imgs;
+  const parent = await sock.sendMessage(jid, { album: { expectedImageCount: imgs, expectedVideoCount: vids } }, opts);
+  const parentKey = (parent && parent.key) || null;
+  let firstId = (parentKey && parentKey.id) || null;
+  let captionPending = text || null; // post text rides the first item as the album caption
+  for (const it of items) {
+    const content = it.kind === 'image' ? { image: { url: it.url } } : { video: { url: it.url } };
+    if (captionPending) { content.caption = captionPending; captionPending = null; }
+    if (parentKey) content.albumParentKey = parentKey;
+    try {
+      const res = await sock.sendMessage(jid, content, opts);
+      if (!firstId && res && res.key) firstId = res.key.id;
+    } catch (e) {
+      console.error('[album] item send failed, continuing with rest:', e.message);
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return firstId;
+}
+
+async function sendToRecipient({ text, imageUrl, videoUrl, mediaUrls, quoteId, to }) {
   const jid = ((to || RECIPIENT) + '').replace(/\D/g, '') + '@s.whatsapp.net';
   let content;
+  // v7: multi-media posts go as one album (1 chat entry). Single media keeps the v3 caption-fold path.
+  if (Array.isArray(mediaUrls) && mediaUrls.length > 1) {
+    const opts0 = quoteId ? { quoted: { key: { id: quoteId, remoteJid: jid, fromMe: true } } } : {};
+    try { const dur = await ephemeralFor(jid); if (dur > 0) opts0.ephemeralExpiration = dur; } catch (e) {}
+    try { return await sendAlbum(jid, text, mediaUrls, opts0); }
+    catch (e) { if (opts0.quoted) return await sendAlbum(jid, text, mediaUrls, {}); throw e; }
+  }
+  if (Array.isArray(mediaUrls) && mediaUrls.length === 1) {
+    const m = mediaUrls[0];
+    if (m.kind === 'image') imageUrl = m.url; else videoUrl = m.url;
+  }
   // v3 caption-folding: a text field alongside media becomes the media's caption (worker folds post text
   // onto the first accepted media to cut message count ~40%). Text-only sends unchanged.
   if (imageUrl) content = { image: { url: imageUrl }, ...(text ? { caption: text } : {}) };
@@ -369,14 +413,28 @@ const server = http.createServer(async (req, res) => {
     let payload;
     try { payload = JSON.parse(body); } catch { return reply(400, { error: 'bad json' }); }
     // transport dedupe: collapse identical sends within 15 min (overlapping poll ticks, duplicate cron events)
-    const fp = createHash('sha1').update(String(payload.to || '') + '|' + (payload.text || '') + '|' + (payload.imageUrl || '') + '|' + (payload.videoUrl || '')).digest('hex');
+    const fp = createHash('sha1').update(String(payload.to || '') + '|' + (payload.text || '') + '|' + (payload.imageUrl || '') + '|' + (payload.videoUrl || '') + '|' + JSON.stringify(payload.mediaUrls || '')).digest('hex');
     const now = Date.now();
     for (const [k, t] of recentSends) if (now - t > 15 * 60 * 1000) recentSends.delete(k);
     if (recentSends.has(fp)) return reply(200, { id: null, dupe: true });
     // perceptual media dedup: same-looking photo/footage from a different account
     // delivers once per 14 days. If ALL media on the post is a perceptual dupe,
     // the whole post is suppressed (not delivered text-only) - per Ezra 9/6.
-    if (payload.imageUrl || payload.videoUrl) {
+    // v7: mediaUrls arrays dedup per item; dupes drop out of the album, survivors deliver.
+    if (Array.isArray(payload.mediaUrls) && payload.mediaUrls.length) {
+      const survivors = [];
+      let droppedDupes = 0;
+      for (const m of payload.mediaUrls) {
+        try {
+          const d = await checkMedia(m.kind === 'image' ? { imageUrl: m.url } : { videoUrl: m.url });
+          if (d.dupe) { droppedDupes++; continue; }
+        } catch (e) { console.error('[dedup] gate error (fail-open):', e.message); }
+        survivors.push(m);
+      }
+      if (!survivors.length) { recentSends.set(fp, now); return reply(200, { id: null, suppressed: 'media-dupe' }); }
+      payload.mediaUrls = survivors;
+      if (droppedDupes) console.log(`[dedup] album: dropped ${droppedDupes} perceptual dupe(s), ${survivors.length} survive`);
+    } else if (payload.imageUrl || payload.videoUrl) {
       try {
         const d = await checkMedia(payload);
         if (d.dupe) { recentSends.set(fp, now); return reply(200, { id: null, suppressed: 'media-dupe', dist: d.dist }); }
