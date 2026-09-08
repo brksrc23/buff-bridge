@@ -636,6 +636,7 @@ let BS_CACHE = null; // isolate-local
 let COLD_GUARD_CUTOFF = 0; // v44c: set on cold load of a stale blob - see poll() guard
 let RETAINED_PENDING = []; // feed_items backlog between 5-min flushes
 let FEED_LAST_WRITE = 0;
+let LAST_FORCE_SAVE = 0; // v46
 async function loadBS(env) {
   if (BS_CACHE) return BS_CACHE;
   let d = null;
@@ -651,7 +652,7 @@ async function loadBS(env) {
   // poll() suppresses anything posted at/before the last save (tweet ids embed post time) - those
   // posts were processed when the blob was written. Older than 45 min = genuine outage backlog: deliver.
   const staleMs = Date.now() - (d.savedAt || 0);
-  if (d.savedAt && staleMs > 3 * 60000 && staleMs <= 45 * 60000) COLD_GUARD_CUTOFF = d.savedAt;
+  if (d.savedAt && staleMs > 75000 && staleMs <= 45 * 60000) COLD_GUARD_CUTOFF = d.savedAt; // v46: floor 3min -> 75s, pairs with the 2-min force-save throttle - a blob older than ~1 min treats pre-save posts as already processed
   BS_CACHE = d;
   return d;
 }
@@ -1041,7 +1042,7 @@ async function poll(env, maxDeliver, diag) {
   if (retained.length) {
     RETAINED_PENDING.push(...retained);
     if (RETAINED_PENDING.length > 800) RETAINED_PENDING = RETAINED_PENDING.slice(-800);
-    if (Date.now() - FEED_LAST_WRITE > 900000) { // v45: feed_items (the "anything on X?" query store) flushes at most every 15 min (KV write budget)
+    if (Date.now() - FEED_LAST_WRITE > 1800000) { // v46: feed_items (the "anything on X?" query store) flushes at most every 30 min (KV write budget)
       const items = await getFeedItems(env);
       items.push(...RETAINED_PENDING);
       if (await kvPut(env, FEED_ITEMS_KEY, JSON.stringify(items.slice(-FEED_ITEMS_MAX)))) { RETAINED_PENDING = []; FEED_LAST_WRITE = Date.now(); }
@@ -1052,7 +1053,9 @@ async function poll(env, maxDeliver, diag) {
   if (!bs.vol || bs.vol.day !== vday) bs.vol = { day: vday, delivered: 0, suppressed: 0, filtered: 0, deferred: 0 };
   bs.vol.delivered += delivered; bs.vol.suppressed += suppressed; bs.vol.filtered += filtered; bs.vol.deferred += deferred;
   if (delivered || suppressed || filtered || deferred) bs.dirty = true;
-  await saveBS(env, bs, delivered > 0); // force-persist on delivery ticks; otherwise the 2-min throttle governs
+  const forceSave = delivered > 0 && Date.now() - LAST_FORCE_SAVE > 120000; // v46: force-persist at most every 2 min on delivery ticks (was every delivery - KV write budget); regular 10-min throttle otherwise
+  if (forceSave) LAST_FORCE_SAVE = Date.now();
+  await saveBS(env, bs, forceSave);
   return `delivered=${delivered} dropped=${dropped} skipped=${skipped} filtered=${filtered} deferred=${deferred} suppressed=${suppressed}${untranslated ? ` untr=${untranslated}` : ""}${storyDupes ? ` storydupes=${storyDupes}` : ""}${held ? ` held=${held}` : ""}${shabbos ? " shabbos" : ""}${paused ? " paused" : ""}${waDown ? " wa_down" : ""}`;
 }
 
@@ -1353,12 +1356,7 @@ async function geminiClassify(env, keyIgnored, rules, mode, tweets, acctRules, r
     let lastStatus = 0, lastBody = "";
     for (const [key, kid] of avail) {
       const r = await geminiClassifyOnce(env, key, rules, mode, tweets, acctRules, recent);
-      if (r && r.verdicts) { // success: count the call against the key that served
-        try {
-          const st2 = await gemKeyState(env); const day2 = new Date().toISOString().slice(0, 10);
-          const cur = st2[kid] || {}; if (cur.day !== day2) { cur.day = day2; cur.calls = 0; }
-          cur.calls = (cur.calls || 0) + 1; st2[kid] = cur; await kvPut(env, "gem_keys", JSON.stringify(st2));
-        } catch (e0) {}
+      if (r && r.verdicts) { // success - v46: no per-call KV write (was ~40 writes/hr at poll cadence, the top driver of the 2026-09-08 write-cap approach); daily call counting lives in the blob's gemCalls, cooldown state still writes on change
         return r.verdicts;
       }
       lastStatus = (r && r.status) || 0; lastBody = (r && r.body) || "";
