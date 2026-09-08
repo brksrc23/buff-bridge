@@ -1,7 +1,7 @@
 // media-dedup.js - perceptual media dedup for buff-bridge.
 // Byte-exact hashing (worker side) misses independent re-uploads of the same
 // photo/footage. This layer computes a perceptual hash (dHash) per image and
-// 3 keyframe dHashes per video, and suppresses media that LOOKS the same as
+// 5 keyframe dHashes per video (v8: was 3), and suppresses media that LOOKS the same as
 // anything delivered in the last 14 days. Genuinely different angles survive:
 // their hashes differ well beyond the Hamming threshold.
 // Fail-open everywhere: any error -> media sends normally.
@@ -18,7 +18,7 @@ const API = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT}/storage/kv
 
 const WINDOW_MS = 14 * 24 * 3600 * 1000; // 14-day memory, matches worker media memory
 const IMG_THRESHOLD = 6;  // hamming distance (of 64 bits) => same-looking image
-const VID_THRESHOLD = 6;  // per-frame threshold
+const VID_THRESHOLD = 9;  // per-frame threshold (v8: 6->9 - a re-encoded dupe measured [7,4,7] on 2026-09-08 and slipped 2-of-3; nearest genuine non-dupe sat at 12+)
 const VID_MIN_FRAMES = 2; // >=2 of 3 keyframes must match for a video dupe
 
 let Jimp = null;
@@ -75,7 +75,7 @@ function runFFmpeg(args, inputBuf) {
   });
 }
 
-// 3 keyframe dHashes for a video buffer; null when extraction impossible.
+// 5 keyframe dHashes for a video buffer (v8: was 3); null when extraction impossible.
 // MP4 needs a seekable input (moov atom), so go through a temp file, not a pipe.
 async function videoHashes(buf) {
   const tmp = path.join(os.tmpdir(), 'dedup-' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.mp4');
@@ -84,7 +84,7 @@ async function videoHashes(buf) {
     const probe = await runFFmpeg(['-i', tmp]); // metadata only: no output args = instant parse, no full decode
     const m = /Duration: (\d+):(\d+):([\d.]+)/.exec(probe.stderr);
     const dur = m ? (+m[1] * 3600 + +m[2] * 60 + +m[3]) : 0;
-    const ats = dur > 2 ? [dur * 0.15, dur * 0.5, dur * 0.85] : [0.5, 1.5, 3];
+    const ats = dur > 2 ? [dur * 0.1, dur * 0.3, dur * 0.5, dur * 0.7, dur * 0.9] : [0.5, 1.5, 2.5, 3.5, 4.5]; // v8: 5 keyframes (was 3) - more alignment chances on re-trimmed clips
     const frames = []; // v5: sequential, not parallel - 3 concurrent ffmpeg decodes + the whole video in heap OOM-killed the 512Mi instance (2026-09-08 crash loop)
     for (const t of ats) frames.push(await runFFmpeg(['-v', 'error', '-ss', t.toFixed(2), '-i', tmp, '-vf', 'scale=144:-2', '-an', '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'png', '-']));
     const hashes = [];
