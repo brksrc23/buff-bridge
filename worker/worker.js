@@ -655,11 +655,13 @@ async function loadBS(env) {
   d.dirty = false;
   d.seenSet = new Set(d.seen);
   // v44c cold-start guard (2026-09-07 dupe flood): KV write cap let a stale isolate clobber the blob,
-  // reverting the seen ring; fresh isolates then re-delivered. If this cold load is 3-45 min stale,
+  // reverting the seen ring; fresh isolates then re-delivered. If this cold load is >75s stale,
   // poll() suppresses anything posted at/before the last save (tweet ids embed post time) - those
-  // posts were processed when the blob was written. Older than 45 min = genuine outage backlog: deliver.
+  // posts were processed when the blob was written.
+  // v47c (approved 2026-09-08 17:11): NO upper age bound - Ezra's fresh-from-now rule is absolute,
+  // a stale blob NEVER means "deliver the gap" (kills the 8-PM-recovery backlog-dump path).
   const staleMs = Date.now() - (d.savedAt || 0);
-  if (d.savedAt && staleMs > 75000 && staleMs <= 45 * 60000) COLD_GUARD_CUTOFF = d.savedAt; // v46: floor 3min -> 75s, pairs with the 2-min force-save throttle - a blob older than ~1 min treats pre-save posts as already processed
+  if (d.savedAt && staleMs > 75000) COLD_GUARD_CUTOFF = d.savedAt; // v46: floor 3min -> 75s, pairs with the 2-min force-save throttle - a blob older than ~1 min treats pre-save posts as already processed
   BS_CACHE = d;
   return d;
 }
@@ -936,6 +938,8 @@ async function poll(env, maxDeliver, diag) {
         if (!t) continue;
         if (t.replyToUserId && t.authorId && t.replyToUserId !== t.authorId) continue;
         if (!passesFilters(t, filters)) continue;
+        // v47c freshness gate: never spend classify budget on posts too old to deliver (see delivery loop)
+        if (snowMs(id) < Date.now() - 20 * 60000) { retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), staleSkipped: true }); bsSeenAdd(bs, id); continue; }
         if (isAlwaysDeliver(t.handle, acctRules)) continue; // v34: bypass accounts never classified
         try { // v36: dupe of an already-delivered story with no new media -> the in-loop check would drop it anyway; skip the judge call
           const hasMedia = (t.media || []).length > 0;
@@ -977,6 +981,16 @@ async function poll(env, maxDeliver, diag) {
     if (preDupes && preDupes.has(id)) continue; // v36: resolved pre-classify
     if (resumeCutoff && snowMs(id) < resumeCutoff) { // posted inside the Shabbos full-off window: keep for queries, never deliver
       retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), windowSkipped: true });
+      bsSeenAdd(bs, id);
+      skipped++;
+      continue;
+    }
+    // v47c freshness gate (Ezra's absolute no-backlog rule, approved 2026-09-08 17:11): a post older
+    // than 20 min at processing time is retained for queries and marked seen, never delivered. Without
+    // this, fail-closed leaves unjudged posts unseen and a classifier recovery would dump the outage
+    // window (normal poll-to-delivery latency is ~1-2 min, so 20 min never touches healthy flow).
+    if (snowMs(id) < Date.now() - 20 * 60000) {
+      retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), staleSkipped: true });
       bsSeenAdd(bs, id);
       skipped++;
       continue;
@@ -1960,7 +1974,7 @@ export default {
           const result = await poll(env, 6); // cap per-tick deliveries so the run stays inside the cron time budget; remainder flows next minute
           const done = `${new Date().toISOString()} ${result}${purged ? ` purged=${purged}` : ""} (${Date.now() - t0}ms)`;
           bs.lastPoll = done; bs.lastDone = done; bs.dirty = true;
-          await saveBS(env, bs, new Date().getUTCMinutes() % 5 === 0); // health markers persist every 5th tick (delivery ticks force-saved inside poll)
+          await saveBS(env, bs, new Date().getUTCMinutes() % 15 === 0); // v47c: health markers persist every 15th tick (was 5th - KV write budget); delivery ticks force-saved inside poll
         } catch (e) {
           try { await saveBS(env, bs, false); } catch (e0) {}
           try {
