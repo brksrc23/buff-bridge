@@ -161,7 +161,8 @@ function extractTweets(payload) {
         kind, text, media, handle, name, authorId,
         origHandle, origName, origText, quotedHandle, quotedName, quotedText,
         replyToStatusId: legacy.in_reply_to_status_id_str || null,
-        replyToUserId: legacy.in_reply_to_user_id_str || null
+        replyToUserId: legacy.in_reply_to_user_id_str || null,
+        postedAt: (rtRaw && rt ? (rt.legacy && rt.legacy.created_at) : null) || legacy.created_at || null
       });
     }
   }
@@ -242,21 +243,41 @@ async function withTranslation(env, text) {
 
 // ---------- message formatting: every message leads with bold Display Name (@handle) ----------
 
+// v44: original posted timestamp under the username line (Ezra 2026-09-07). Twitter legacy.created_at
+// format: "Mon Sep 07 18:04:12 +0000 2026". Unparseable -> line omitted, never a delivery blocker.
+const TW_MONTHS = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+function parseTweetTime(s) {
+  if (!s || typeof s !== "string") return null;
+  const m = /^\w{3} (\w{3}) (\d{2}) (\d{2}):(\d{2}):(\d{2}) ([+-]\d{4}) (\d{4})$/.exec(s);
+  if (!m || !(m[1] in TW_MONTHS)) return null;
+  const ms = Date.UTC(+m[7], TW_MONTHS[m[1]], +m[2], +m[3], +m[4], +m[5]);
+  const off = parseInt(m[6], 10); // +0000 style
+  return ms - (off >= 0 ? 1 : -1) * (Math.abs(off) >= 100 ? (Math.floor(Math.abs(off) / 100) * 3600e3 + (Math.abs(off) % 100) * 60e3) : 0);
+}
+function fmtPosted(ms) {
+  if (!ms) return null;
+  try {
+    return new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", month: "numeric", day: "numeric", year: "2-digit", hour: "numeric", minute: "2-digit", hour12: true }).format(new Date(ms)).replace(/,\s*/, " "); // "9/7/26 2:04 PM" - Ezra's requested style
+  } catch (e) { return null; }
+}
+
 async function formatBody(env, t) {
   // Ezra 2026-09-03: strip t.co/x.com links (content only, no URLs); non-English gets original + English underneath.
   // Returns null when a segment needs translation but both rails failed - caller drops the whole post (Ezra 2026-09-06 rule).
   const clean = async (s) => withTranslation(env, stripLinks(s || "") || "(link only)");
+  const when = fmtPosted(parseTweetTime(t.postedAt));
+  const tline = when ? `\n${when}` : "";
   if (t.kind === "retweet") {
     const c = await clean(t.origText); if (c === null) return null;
-    return `*${t.name} (@${t.handle})* retweeted *${t.origName} (@${t.origHandle})*:\n\n${c}`;
+    return `*${t.name} (@${t.handle})* retweeted *${t.origName} (@${t.origHandle})*:${tline}\n\n${c}`;
   }
   if (t.kind === "quote") {
     const c1 = await clean(t.text); if (c1 === null) return null;
     const c2 = await clean(t.quotedText); if (c2 === null) return null;
-    return `*${t.name} (@${t.handle})* commented:\n${c1}\n\n----------\n*${t.quotedName} (@${t.quotedHandle})* posted:\n${c2}`;
+    return `*${t.name} (@${t.handle})* commented:${tline}\n${c1}\n\n----------\n*${t.quotedName} (@${t.quotedHandle})* posted:\n${c2}`;
   }
   const c = await clean(t.text); if (c === null) return null;
-  return `*${t.name} (@${t.handle})*\n\n${c}`;
+  return `*${t.name} (@${t.handle})*${tline}\n\n${c}`;
 }
 
 // ---------- Shabbos hold (2026-09-04, Ezra) ----------
@@ -610,8 +631,9 @@ async function getJSON(env, key, fallback) {
 // ---------- v29: consolidated state blob - one KV read per tick, at most one throttled write ----------
 // Replaces the per-item seen:/gem:/media:/sent: keys that were burning the free-tier daily read+write budgets.
 const BS_KEY = "bs_v1";
-const BS_SAVE_MIN_MS = 120000; // cross-isolate throttle: one blob write per 2 min unless forced
+const BS_SAVE_MIN_MS = 600000; // v45 (2026-09-07 KV-cap flood): one blob write per 10 min unless forced - 2-min cadence alone was ~720 of the 1,000/day free write budget
 let BS_CACHE = null; // isolate-local
+let COLD_GUARD_CUTOFF = 0; // v44c: set on cold load of a stale blob - see poll() guard
 let RETAINED_PENDING = []; // feed_items backlog between 5-min flushes
 let FEED_LAST_WRITE = 0;
 async function loadBS(env) {
@@ -624,6 +646,12 @@ async function loadBS(env) {
   if (d.gemPurgedV41 !== true) { d.gem = {}; d.gemPurgedV41 = true; d.dirty = true; }
   d.dirty = false;
   d.seenSet = new Set(d.seen);
+  // v44c cold-start guard (2026-09-07 dupe flood): KV write cap let a stale isolate clobber the blob,
+  // reverting the seen ring; fresh isolates then re-delivered. If this cold load is 3-45 min stale,
+  // poll() suppresses anything posted at/before the last save (tweet ids embed post time) - those
+  // posts were processed when the blob was written. Older than 45 min = genuine outage backlog: deliver.
+  const staleMs = Date.now() - (d.savedAt || 0);
+  if (d.savedAt && staleMs > 3 * 60000 && staleMs <= 45 * 60000) COLD_GUARD_CUTOFF = d.savedAt;
   BS_CACHE = d;
   return d;
 }
@@ -769,6 +797,27 @@ async function poll(env, maxDeliver, diag) {
     for (const id of ids) bsSeenAdd(bs, id);
     await saveBS(env, bs, true);
     return `v29 bootstrap: seeded ${ids.length} timeline ids into the state blob, delivered none`;
+  }
+
+  if (COLD_GUARD_CUTOFF) { // v44c: mark pre-save posts seen without delivering; fresh posts flow normally
+    let guarded = 0;
+    for (const id of ids) {
+      try { if (snowMs(id) <= COLD_GUARD_CUTOFF && !bsSeenHas(bs, id)) { bsSeenAdd(bs, id); guarded++; } } catch (e0) {}
+    }
+    COLD_GUARD_CUTOFF = 0;
+    if (guarded) { try { await saveBS(env, bs, true); } catch (e0) {} }
+    if (d) d.coldStartGuard = guarded;
+  }
+
+  // v44d emergency delivery hold (2026-09-07 flood): KV write cap let a stale isolate clobber the
+  // blob and revert the seen ring - every cold poll re-delivered. Until KV writes recover
+  // (free-tier daily reset 00:00 UTC), mark everything seen, deliver nothing. Self-expires at
+  // 00:10 UTC (8:10 PM EDT) - no redeploy needed; cold-start guard above covers any straggler case.
+  if (Date.now() < Date.UTC(2026, 8, 8, 0, 10)) {
+    let held = 0;
+    for (const id of ids) if (!bsSeenHas(bs, id)) { bsSeenAdd(bs, id); held++; }
+    try { await saveBS(env, bs, true); } catch (e0) {}
+    return "v44d emergency hold: marked " + held + " seen, delivered 0 (until 00:10 UTC)";
   }
 
   const paused = !!(await env.BUFF_KV.get("feed_paused"));
@@ -992,7 +1041,7 @@ async function poll(env, maxDeliver, diag) {
   if (retained.length) {
     RETAINED_PENDING.push(...retained);
     if (RETAINED_PENDING.length > 800) RETAINED_PENDING = RETAINED_PENDING.slice(-800);
-    if (Date.now() - FEED_LAST_WRITE > 300000) { // feed_items (the "anything on X?" query store) flushes at most every 5 min
+    if (Date.now() - FEED_LAST_WRITE > 900000) { // v45: feed_items (the "anything on X?" query store) flushes at most every 15 min (KV write budget)
       const items = await getFeedItems(env);
       items.push(...RETAINED_PENDING);
       if (await kvPut(env, FEED_ITEMS_KEY, JSON.stringify(items.slice(-FEED_ITEMS_MAX)))) { RETAINED_PENDING = []; FEED_LAST_WRITE = Date.now(); }
@@ -1220,7 +1269,36 @@ const DEFAULT_ACCT_RULES = {
 };
 const getAcctRules = async (env) => ({ ...DEFAULT_ACCT_RULES, ...(await getJSON(env, "acct_rules", {})) }); // KV overrides win; defaults ship in code
 const isAlwaysDeliver = (handle, acctRules) => { const r = (acctRules || {})[(handle || "").toLowerCase()]; return !!r && /^\s*always deliver/i.test(r); }; // v34: true bypass - never gated by Gemini
-const getGeminiKey = async (env) => env.GEMINI_API_KEY || (await env.BUFF_KV.get("gemini_key")) || null;
+const getGeminiKey = async (env) => env.GEMINI_API_KEY || (await env.BUFF_KV.get("gemini_key")) || null; // legacy single-key getter (translation rail)
+// v45: multi-key pooling. GEMINI_API_KEY (or legacy gemini_key) may hold comma-separated keys, each from its OWN
+// AI Studio project (the 500/day free cap is per-PROJECT - two keys in one project share one pool, learned 2026-09-07).
+const getGeminiKeys = async (env) => {
+  const raw = env.GEMINI_API_KEY || (await env.BUFF_KV.get("gemini_key")) || "";
+  return raw.split(",").map((k) => k.trim()).filter((k) => k.length > 10);
+};
+const gemKeyId = async (k) => { // never store/log a full key: sha256 of the last 6 chars
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(k.slice(-6)));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+};
+async function gemKeyState(env) {
+  try { return JSON.parse((await env.BUFF_KV.get("gem_keys")) || "{}") || {}; } catch (e) { return {}; }
+}
+async function gemKeyCool(env, id, until, daily, errSig) {
+  try {
+    const st = await gemKeyState(env);
+    st[id] = { cool: until, daily: !!daily, at: new Date().toISOString(), sig: (errSig || "").slice(0, 80) };
+    await kvPut(env, "gem_keys", JSON.stringify(st));
+  } catch (e0) {}
+}
+function nextPTmidnight() { // Gemini daily quota resets midnight America/Los_Angeles
+  try {
+    const fmt = new Intl.DateTimeFormat("en-US", { timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+    const p = Object.fromEntries(fmt.formatToParts(new Date()).map((x) => [x.type, x.value]));
+    const ptNow = new Date(`${p.year}-${p.month}-${p.day}T${p.hour === "24" ? "00" : p.hour}:${p.minute}:${p.second}`);
+    const next = new Date(ptNow); next.setDate(next.getDate() + 1); next.setHours(0, 0, 0, 0);
+    return Date.now() + (next.getTime() - ptNow.getTime());
+  } catch (e) { return Date.now() + 8 * 3600e3; }
+}
 
 // Classify a batch of candidate posts. FAIL-OPEN: any error, timeout, or malformed answer -> deliver everything.
 // gem:<id> values: legacy "1"/"0" bits or {"d":bool,"r":"one-line reason"}. parseGem normalizes.
@@ -1263,7 +1341,48 @@ async function waiClassify(env, rules, mode, tweets, acctRules, recent) {
   }
 }
 
-async function geminiClassify(env, key, rules, mode, tweets, acctRules, recent) {
+async function geminiClassify(env, keyIgnored, rules, mode, tweets, acctRules, recent) {
+  try { // v45: pool loop over keys - on quota 429, cool that key and try the next project
+    const keys = await getGeminiKeys(env);
+    if (!keys.length) return null;
+    const kst = await gemKeyState(env);
+    const now0 = Date.now();
+    const avail = [];
+    for (const k of keys) { const id = await gemKeyId(k); const st = kst[id]; if (!st || !st.cool || now0 >= st.cool) avail.push([k, id]); }
+    if (!avail.length) return null; // every key cooled -> judge net engages
+    let lastStatus = 0, lastBody = "";
+    for (const [key, kid] of avail) {
+      const r = await geminiClassifyOnce(env, key, rules, mode, tweets, acctRules, recent);
+      if (r && r.verdicts) { // success: count the call against the key that served
+        try {
+          const st2 = await gemKeyState(env); const day2 = new Date().toISOString().slice(0, 10);
+          const cur = st2[kid] || {}; if (cur.day !== day2) { cur.day = day2; cur.calls = 0; }
+          cur.calls = (cur.calls || 0) + 1; st2[kid] = cur; await kvPut(env, "gem_keys", JSON.stringify(st2));
+        } catch (e0) {}
+        return r.verdicts;
+      }
+      lastStatus = (r && r.status) || 0; lastBody = (r && r.body) || "";
+      if (lastStatus === 429) {
+        const daily = /limit:\s*500|PerDay/i.test(lastBody);
+        await gemKeyCool(env, kid, daily ? nextPTmidnight() : Date.now() + 5 * 60000, daily, lastBody);
+        continue; // next key in the pool
+      }
+      if (lastStatus === 0) continue; // network/timeout/unparseable on this key - try the next before giving up
+      break; // 400/403 etc: key itself bad - no point hammering the pool
+    }
+    return null; // v34 fail-closed: caller holds unjudged posts (judge net engages)
+  } catch (e) {
+    try {
+      const msg = `${new Date().toISOString()} gemini classify throw: ${String((e && e.message) || e).slice(0, 140)}`;
+      const prev = await env.BUFF_KV.get("last_error");
+      if (!prev || prev.slice(24) !== msg.slice(24)) await kvPut(env, "last_error", msg);
+    } catch (e0) {}
+    return null;
+  }
+}
+
+// v45: single-key attempt, split out of the old geminiClassify. Returns {verdicts} | {status, body} (never throws).
+async function geminiClassifyOnce(env, key, rules, mode, tweets, acctRules, recent) {
   const verdicts = new Map(tweets.map((t) => [t.id, { d: true }]));
   try {
     const ar = acctRules || {};
@@ -1284,8 +1403,6 @@ async function geminiClassify(env, key, rules, mode, tweets, acctRules, recent) 
       (recent && recent.length ? "ALREADY DELIVERED to the user in the last few hours (each line = one delivered post):\n- " + recent.slice(-40).join("\n- ") + "\nDrop any post that restates facts already delivered above unless it carries MATERIALLY NEW information (new casualty toll, official finding, genuinely new footage/angle, new location or development). A different outlet repeating the same facts is a DROP.\n" : "") +
       "Posts:\n" + JSON.stringify(brief) + "\n" +
       "Reply with ONLY a JSON array like [{\"id\":\"...\",\"deliver\":true,\"reason\":\"one short line\"}] covering every post id. Reason: max 12 words, plain. No other prose.";
-    const cool = await env.BUFF_KV.get("gemini_cooldown"); // v35c: quota backoff - don't hammer a 429ing project
-    if (cool && Date.now() < Number(cool)) return null;
     const res = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
       method: "POST",
       headers: { "content-type": "application/json", "x-goog-api-key": key },
@@ -1298,26 +1415,25 @@ async function geminiClassify(env, key, rules, mode, tweets, acctRules, recent) 
       signal: AbortSignal.timeout(20000),
     });
     if (!res.ok) { // v35b: surface the failure reason - fail-closed silence is invisible without it
-      if (res.status === 429) { try { await kvPut(env, "gemini_cooldown", String(Date.now() + 5 * 60000), { expirationTtl: 600 }); } catch (e0) {} } // v35c: 5-min classify backoff
+      let eb = "";
       try {
-        const eb = (await res.text()).slice(0, 500); // v36b: enough to capture the quota metric name
+        eb = (await res.text()).slice(0, 500); // v36b: enough to capture the quota metric name
         const msg = `${new Date().toISOString()} gemini classify HTTP ${res.status}: ${eb}`;
         const prev = await env.BUFF_KV.get("last_error");
         if (!prev || prev.slice(24) !== msg.slice(24)) await kvPut(env, "last_error", msg);
       } catch (e0) {}
-      return null; // v34 fail-closed: caller holds unjudged posts
+      return { status: res.status, body: eb }; // v45: rotation decides cool/retry
     }
     const data = await res.json();
     let txt = (data.steps || []).filter((st) => st && st.type === "model_output").flatMap((st) => st.content || []).filter((c) => c && c.type === "text").map((c) => c.text || "").join("");
     const start = txt.indexOf("["), end = txt.lastIndexOf("]");
     if (start < 0 || end <= start) { // v35b: unparseable/blocked output - record a snippet
-      try { await kvPut(env, "gemini_cooldown", String(Date.now() + 2 * 60000), { expirationTtl: 600 }); } catch (e0) {} // v36: don't retry-storm a bad batch
       try {
         const msg = `${new Date().toISOString()} gemini classify unparseable output: ${txt.slice(0, 100) || "(empty)"}`;
         const prev = await env.BUFF_KV.get("last_error");
         if (!prev || prev.slice(24) !== msg.slice(24)) await kvPut(env, "last_error", msg);
       } catch (e0) {}
-      return null; // v34 fail-closed
+      return { status: 0, body: "unparseable" }; // v45: another key may behave; pool decides
     }
     const arr = JSON.parse(txt.slice(start, end + 1));
     const covered = new Set();
@@ -1336,9 +1452,9 @@ async function geminiClassify(env, key, rules, mode, tweets, acctRules, recent) 
       const prev = await env.BUFF_KV.get("last_error");
       if (!prev || prev.slice(24) !== msg.slice(24)) await kvPut(env, "last_error", msg);
     } catch (e0) {}
-    return null; /* v34 fail-closed */
+    return { status: 0, body: String((e && e.message) || e).slice(0, 120) };
   }
-  return verdicts;
+  return { verdicts };
 }
 
 
@@ -1364,7 +1480,7 @@ async function renderPower(env, action) { // "suspend" | "resume"
 }
 
 // ---------- admin dashboard ----------
-const ADMIN_HTML = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>BUFF Admin</title>\n<style>\n  :root { --bg:#0f1115; --card:#181c24; --line:#262c38; --txt:#e8eaf0; --dim:#8b93a5; --accent:#4da3ff; --green:#3ddc84; --red:#ff5c5c; }\n  * { box-sizing:border-box; }\n  body { margin:0; background:var(--bg); color:var(--txt); font:15px/1.45 -apple-system, system-ui, sans-serif; }\n  .wrap { max-width:860px; margin:0 auto; padding:16px; }\n  h1 { font-size:20px; margin:8px 0 2px; }\n  .sub { color:var(--dim); font-size:13px; margin-bottom:16px; }\n  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin-bottom:14px; }\n  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 10px; }\n  .row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }\n  .modes button, .pill { border:1px solid var(--line); background:#10141b; color:var(--txt); border-radius:999px; padding:8px 14px; cursor:pointer; font-size:14px; }\n  .modes button.active { background:var(--accent); border-color:var(--accent); color:#04101f; font-weight:600; }\n  .toggle { width:46px; height:26px; border-radius:999px; background:#2a3140; border:1px solid var(--line); position:relative; cursor:pointer; flex:none; }\n  .toggle::after { content:\"\"; position:absolute; top:2px; left:2px; width:20px; height:20px; border-radius:50%; background:#fff; transition:left .15s; }\n  .toggle.on { background:var(--green); }\n  .toggle.on::after { left:22px; }\n  table { width:100%; border-collapse:collapse; }\n  td, th { text-align:left; padding:7px 6px; border-bottom:1px solid var(--line); font-size:14px; }\n  th { color:var(--dim); font-size:12px; font-weight:600; }\n  .muted-h { color:var(--dim); }\n  input[type=text], input[type=password], textarea { width:100%; background:#10141b; border:1px solid var(--line); color:var(--txt); border-radius:8px; padding:9px 10px; font-size:14px; }\n  textarea { min-height:110px; font-family:inherit; }\n  .btn { background:var(--accent); color:#04101f; border:0; border-radius:8px; padding:9px 14px; font-weight:600; cursor:pointer; }\n  .btn.ghost { background:#10141b; color:var(--txt); border:1px solid var(--line); }\n  .btn.danger { background:transparent; color:var(--red); border:1px solid var(--red); padding:4px 10px; font-size:13px; }\n  .chip { display:inline-flex; align-items:center; gap:8px; background:#10141b; border:1px solid var(--line); border-radius:999px; padding:6px 12px; margin:3px 4px 3px 0; font-size:14px; }\n  .chip button { background:none; border:0; color:var(--red); cursor:pointer; font-size:15px; padding:0; }\n  .stat { display:flex; justify-content:space-between; padding:5px 0; font-size:14px; }\n  .stat span:last-child { color:var(--dim); }\n  .ok { color:var(--green); } .bad { color:var(--red); }\n  #login { max-width:380px; margin:18vh auto 0; }\n  .hint { color:var(--dim); font-size:12px; margin-top:6px; }\n  .hidden { display:none; }\n</style>\n</head>\n<body>\n<div id=\"login\" class=\"card\">\n  <h1>BUFF Admin</h1>\n  <p class=\"sub\">Enter the admin key to manage the feed.</p>\n  <input type=\"password\" id=\"key\" placeholder=\"Admin key\" autocomplete=\"off\">\n  <div style=\"height:10px\"></div>\n  <button class=\"btn\" onclick=\"saveKey()\">Open dashboard</button>\n  <div class=\"hint\" id=\"loginErr\"></div>\n</div>\n<div class=\"wrap hidden\" id=\"app\">\n  <h1>BUFF Admin</h1>\n  <div class=\"sub\">X feed to WhatsApp - live control</div>\n\n  <div class=\"card\">\n    <h2>Feed</h2>\n    <div class=\"row\">\n      <div class=\"toggle\" id=\"pauseToggle\" onclick=\"setPaused()\"></div>\n      <div id=\"pauseLabel\">...</div>\n    </div>\n    <div class=\"hint\">Paused = nothing sends, feed keeps collecting. Start = resume from now. Never a backlog dump.</div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Bot power</h2>\n    <div class=\"row\">\n      <button class=\"btn\" id=\"powerBtn\" onclick=\"setPower()\">...</button>\n      <span class=\"hint\" id=\"powerHint\"></span>\n    </div>\n    <div class=\"hint\">OFF = stops polling and suspends the WhatsApp link (full Shabbos mode). ON = resumes. No catch-up either way - it continues from the moment you switch.</div>\n  </div>\n\n  <div class=\"card modes\">\n    <h2>Shabbos</h2>\n    <div class=\"row\">\n      <button data-smode=\"off\" onclick=\"setShabbosMode('off')\">Fully off</button>\n      <button data-smode=\"digest\" onclick=\"setShabbosMode('digest')\">Silent collect + rundown</button>\n    </div>\n    <div class=\"hint\" id=\"smodeHint\"></div>\n  </div>\n\n  <div class=\"card modes\">\n    <h2>Mode</h2>\n    <div class=\"row\">\n      <button data-mode=\"everything\" onclick=\"setMode('everything')\">Everything</button>\n      <button data-mode=\"breaking\" onclick=\"setMode('breaking')\">Breaking news only</button>\n      <button data-mode=\"custom\" onclick=\"setMode('custom')\">Custom (rules)</button>\n    </div>\n    <div class=\"hint\" id=\"modeHint\"></div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Content filters</h2>\n    <table><tbody>\n      <tr><td>Drop bare article-link posts (all accounts)</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgLinks\" onclick=\"setDrop('links')\"></div></td></tr>\n      <tr><td>Drop posts with videos</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgVideo\" onclick=\"setDrop('video')\"></div></td></tr>\n      <tr><td>Drop posts with images</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgImage\" onclick=\"setDrop('image')\"></div></td></tr>\n      <tr><td>Drop posts with GIFs</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgGif\" onclick=\"setDrop('gif')\"></div></td></tr>\n      <tr><td>Media memory (skip media already sent)</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgDedup\" onclick=\"setDedup()\"></div></td></tr>\n    </tbody></table>\n    <div class=\"hint\">Logo/boilerplate media is handled by media memory - it stays on unless you switch it off here.</div>\n  </div>\n  <div class=\"hint\" style=\"margin:-4px 0 14px\">Account list is managed on X itself. To mute an account or drop its link-only posts without removing it, text the bot: <b>mute @handle</b>, <b>linkonly @handle</b>.</div>\n\n  <div class=\"card\">\n    <h2>Gatekeeper rules (Gemini)</h2>\n    <div class=\"hint\">One rule per line, plain English. Used in Breaking and Custom modes. Default: deliver breaking news AND major updates to ongoing stories; drop routine commentary, opinion, and link-only posts. If Gemini is unreachable, posts deliver anyway (fail open).</div>\n    <div style=\"height:8px\"></div>\n    <textarea id=\"rules\"></textarea>\n    <div style=\"height:8px\"></div>\n    <div class=\"row\">\n      <button class=\"btn\" onclick=\"saveRules()\">Save rules</button>\n      <input type=\"password\" id=\"gemKey\" placeholder=\"Gemini API key - one-time install, stored as a Cloudflare secret\" style=\"flex:1\">\n      <button class=\"btn ghost\" onclick=\"saveGemKey()\">Install key</button>\n    </div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Status</h2>\n    <div class=\"stat\"><span>Last poll</span><span id=\"sLastPoll\">-</span></div>\n    <div class=\"stat\"><span>Last error</span><span id=\"sLastError\">-</span></div>\n    <div class=\"stat\"><span>WhatsApp link</span><span id=\"sWa\">-</span></div>\n    <div class=\"stat\"><span>Gemini gatekeeper</span><span id=\"sGem\">-</span></div>\n    <div class=\"stat\"><span>Pending account adds</span><span id=\"sPend\">-</span></div>\n    <div class=\"stat\"><span>Today: delivered / dupes skipped / filtered out</span><span id=\"sVol\">-</span></div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Watches</h2>\n    <div class=\"row\" style=\"margin-bottom:8px\">\n      <input type=\"text\" id=\"watchPhrase\" placeholder=\"Alert me when a post mentions...\" style=\"flex:1\">\n      <button class=\"btn\" onclick=\"addWatch()\">Watch</button>\n    </div>\n    <div id=\"watchList\"></div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Subscribers</h2>\n    <div class=\"row\" style=\"margin-bottom:8px\">\n      <input type=\"text\" id=\"subPhone\" placeholder=\"Phone, e.g. 1443...\" style=\"flex:1\">\n      <button class=\"btn\" onclick=\"addSub()\">Add</button>\n    </div>\n    <table><tbody id=\"subRows\"></tbody></table>\n  </div>\n\n  <div class=\"card\">\n    <h2>Access</h2>\n    <div class=\"hint\">Change the dashboard key. Anyone with the key can control the feed - keep it private.</div>\n    <div style=\"height:8px\"></div>\n    <input type=\"password\" id=\"curKey\" placeholder=\"Current key\">\n    <div style=\"height:8px\"></div>\n    <input type=\"password\" id=\"newKey\" placeholder=\"New key (8+ characters)\">\n    <div style=\"height:8px\"></div>\n    <button class=\"btn\" onclick=\"changeKey()\">Change key</button>\n    <span class=\"hint\" id=\"keyMsg\"></span>\n  </div>\n</div>\n<script>\nlet KEY = localStorage.getItem('buff_admin_key') || '';\nasync function api(path, body) {\n  const res = await fetch('/admin/api' + path, {\n    method: body ? 'POST' : 'GET',\n    headers: { 'content-type': 'application/json', 'x-admin-key': KEY },\n    body: body ? JSON.stringify(body) : undefined\n  });\n  if (res.status === 401) { showLogin('Wrong key.'); throw new Error('401'); }\n  return res.json();\n}\nfunction showLogin(err) {\n  document.getElementById('login').classList.remove('hidden');\n  document.getElementById('app').classList.add('hidden');\n  document.getElementById('loginErr').textContent = err || '';\n}\nfunction saveKey() {\n  KEY = document.getElementById('key').value.trim();\n  localStorage.setItem('buff_admin_key', KEY);\n  load();\n}\nfunction esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }\nasync function load() {\n  let s;\n  try { s = await api('/state'); } catch (e) { return; }\n  document.getElementById('login').classList.add('hidden');\n  document.getElementById('app').classList.remove('hidden');\n  const pt = document.getElementById('pauseToggle');\n  pt.classList.toggle('on', !s.paused);\n  document.getElementById('pauseLabel').innerHTML = s.paused ? '<b class=\"bad\">PAUSED</b> - tap to resume' : '<b class=\"ok\">RUNNING</b> - tap to pause';\n  document.querySelectorAll('.modes button').forEach(b => b.classList.toggle('active', b.dataset.mode === s.mode));\n  document.querySelectorAll('[data-smode]').forEach(b => b.classList.toggle('active', b.dataset.smode === (s.shabbosMode || 'off')));\n  document.getElementById('smodeHint').textContent = (s.shabbosMode === 'digest') ? 'Collects silently during Shabbos, then sends one sectioned rundown after havdalah.' : 'Fully dark from candle-lighting to havdalah - no collecting, nothing sent. Resumes live after.';\n  document.getElementById('modeHint').textContent =\n    s.mode === 'everything' ? 'Everything delivers (muted/link-only filters still apply). Gemini is bypassed.' :\n    s.mode === 'breaking' ? 'Gemini passes only breaking news and event footage, plus your always-deliver rules.' :\n    'Gemini judges every post against your rules below.';\n  const pb = document.getElementById('powerBtn');\n  pb.textContent = s.power === 'off' ? 'Turn bot ON' : 'Turn bot OFF';\n  pb.style.background = s.power === 'off' ? 'var(--green)' : 'var(--red)';\n  pb.style.color = s.power === 'off' ? '#04101f' : '#fff';\n  document.getElementById('powerHint').textContent = s.power === 'off' ? 'Bot is fully OFF.' : 'Bot is on.' + (s.powerConfigured ? '' : ' (power control not wired yet)');\n  document.getElementById('sLastPoll').textContent = s.lastPoll || 'never';\n  document.getElementById('sLastError').textContent = s.lastError || 'none';\n  document.getElementById('sWa').innerHTML = s.waDown ? '<b class=\"bad\">down</b>' : '<b class=\"ok\">connected</b>';\n  document.getElementById('sGem').textContent = s.gemini + (s.geminiUsage != null ? ' (' + s.geminiUsage + ' calls today)' : '');\n  document.getElementById('sPend').textContent = s.pendingAdds.length ? s.pendingAdds.map(p => '@' + p.handle).join(', ') : 'none';\n  document.getElementById('rules').value = (s.rules || []).join('\\n');\n  const d = s.drop || {};\n  document.getElementById('tgLinks').classList.toggle('on', !!(d.links || s.linkOnlyAll));\n  document.getElementById('tgVideo').classList.toggle('on', !!d.video);\n  document.getElementById('tgImage').classList.toggle('on', !!d.image);\n  document.getElementById('tgGif').classList.toggle('on', !!d.gif);\n  document.getElementById('tgDedup').classList.toggle('on', !s.dedupOff);\n  const v = s.volume || {};\n  document.getElementById('sVol').textContent = (v.delivered||0) + ' / ' + (v.suppressed||0) + ' / ' + (v.filtered||0);\n  if (s.pendingRemovals && s.pendingRemovals.length) document.getElementById('sPend').textContent += ' | queued X-removals: ' + s.pendingRemovals.map(p => '@' + p.handle).join(', ');\n  document.getElementById('watchList').innerHTML = (s.watches || []).map(w =>\n    '<span class=\"chip\">' + esc(w.phrase) + ' <button onclick=\"delWatch(\\'' + esc(w.phrase) + '\\')\">&times;</button></span>').join('') || '<span class=\"hint\">None.</span>';\n  document.getElementById('subRows').innerHTML = (s.subscribers || []).map(p =>\n    '<tr><td>' + esc(p.phone) + (p.paused ? ' <span class=\"muted-h\">(paused)</span>' : '') + '</td>' +\n    '<td style=\"text-align:right\"><button class=\"btn danger\" onclick=\"delSub(\\'' + esc(p.phone) + '\\')\">Remove</button></td></tr>').join('') || '<tr><td class=\"muted-h\">None.</td></tr>';\n}\nasync function setPaused() { const s = await api('/state'); await api('/pause', { paused: !s.paused }); load(); }\nasync function setMode(m) { await api('/mode', { mode: m }); load(); }\nasync function saveRules() { await api('/rules', { rules: document.getElementById('rules').value.split('\\n').map(x => x.trim()).filter(Boolean) }); load(); }\nasync function saveGemKey() { const k = document.getElementById('gemKey').value.trim(); if (!k) return; await api('/gemini-key', { key: k }); document.getElementById('gemKey').value = ''; load(); }\nasync function addWatch() { const p = document.getElementById('watchPhrase').value.trim(); if (!p) return; await api('/watch-add', { phrase: p }); document.getElementById('watchPhrase').value = ''; load(); }\nasync function delWatch(p) { await api('/watch-del', { phrase: p }); load(); }\nasync function addSub() { const p = document.getElementById('subPhone').value.trim(); if (!p) return; await api('/sub-add', { phone: p }); document.getElementById('subPhone').value = ''; load(); }\nasync function delSub(p) { await api('/sub-del', { phone: p }); load(); }\nasync function setDrop(k) { const s = await api('/state'); const d = s.drop || {}; const body = {}; body[k] = !(k === 'links' ? (d.links || s.linkOnlyAll) : d[k]); await api('/drop', body); load(); }\nasync function setDedup() { const s = await api('/state'); await api('/dedup', { off: !s.dedupOff }); load(); }\nasync function changeKey() {\n  const msg = document.getElementById('keyMsg');\n  const res = await fetch('/admin/api/admin-key', { method: 'POST', headers: { 'content-type': 'application/json', 'x-admin-key': KEY }, body: JSON.stringify({ current: document.getElementById('curKey').value, next: document.getElementById('newKey').value }) });\n  const j = await res.json().catch(() => ({}));\n  if (res.ok && j.ok) { KEY = document.getElementById('newKey').value; localStorage.setItem('buff_admin_key', KEY); msg.textContent = 'Key changed - you are now using the new key.'; }\n  else msg.textContent = j.error || 'Failed.';\n}\nasync function setShabbosMode(m) { await api('/shabbos-mode', { mode: m }); load(); }\nasync function setPower() { const s = await api('/state'); const on = s.power === 'off'; if (!confirm(on ? 'Turn the bot ON? It resumes from now, no catch-up.' : 'Turn the bot fully OFF? Polling stops and the WhatsApp link suspends.')) return; const r = await api('/power', { on }); if (!r.ok) alert('Power switch had a problem: ' + JSON.stringify(r.steps)); load(); }\nif (KEY) load(); else showLogin();\n</script>\n</body>\n</html>\n";
+const ADMIN_HTML = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>BUFF Admin</title>\n<style>\n  :root { --bg:#0f1115; --card:#181c24; --line:#262c38; --txt:#e8eaf0; --dim:#8b93a5; --accent:#4da3ff; --green:#3ddc84; --red:#ff5c5c; }\n  * { box-sizing:border-box; }\n  body { margin:0; background:var(--bg); color:var(--txt); font:15px/1.45 -apple-system, system-ui, sans-serif; }\n  .wrap { max-width:860px; margin:0 auto; padding:16px; }\n  h1 { font-size:20px; margin:8px 0 2px; }\n  .sub { color:var(--dim); font-size:13px; margin-bottom:16px; }\n  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin-bottom:14px; }\n  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 10px; }\n  .row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }\n  .modes button, .pill { border:1px solid var(--line); background:#10141b; color:var(--txt); border-radius:999px; padding:8px 14px; cursor:pointer; font-size:14px; }\n  .modes button.active { background:var(--accent); border-color:var(--accent); color:#04101f; font-weight:600; }\n  .toggle { width:46px; height:26px; border-radius:999px; background:#2a3140; border:1px solid var(--line); position:relative; cursor:pointer; flex:none; }\n  .toggle::after { content:\"\"; position:absolute; top:2px; left:2px; width:20px; height:20px; border-radius:50%; background:#fff; transition:left .15s; }\n  .toggle.on { background:var(--green); }\n  .toggle.on::after { left:22px; }\n  table { width:100%; border-collapse:collapse; }\n  td, th { text-align:left; padding:7px 6px; border-bottom:1px solid var(--line); font-size:14px; }\n  th { color:var(--dim); font-size:12px; font-weight:600; }\n  .muted-h { color:var(--dim); }\n  input[type=text], input[type=password], textarea { width:100%; background:#10141b; border:1px solid var(--line); color:var(--txt); border-radius:8px; padding:9px 10px; font-size:14px; }\n  textarea { min-height:110px; font-family:inherit; }\n  .btn { background:var(--accent); color:#04101f; border:0; border-radius:8px; padding:9px 14px; font-weight:600; cursor:pointer; }\n  .btn.ghost { background:#10141b; color:var(--txt); border:1px solid var(--line); }\n  .btn.danger { background:transparent; color:var(--red); border:1px solid var(--red); padding:4px 10px; font-size:13px; }\n  .chip { display:inline-flex; align-items:center; gap:8px; background:#10141b; border:1px solid var(--line); border-radius:999px; padding:6px 12px; margin:3px 4px 3px 0; font-size:14px; }\n  .chip button { background:none; border:0; color:var(--red); cursor:pointer; font-size:15px; padding:0; }\n  .stat { display:flex; justify-content:space-between; padding:5px 0; font-size:14px; }\n  .stat span:last-child { color:var(--dim); }\n  .ok { color:var(--green); } .bad { color:var(--red); }\n  #login { max-width:380px; margin:18vh auto 0; }\n  .hint { color:var(--dim); font-size:12px; margin-top:6px; }\n  .hidden { display:none; }\n</style>\n</head>\n<body>\n<div id=\"login\" class=\"card\">\n  <h1>BUFF Admin</h1>\n  <p class=\"sub\">Enter the admin key to manage the feed.</p>\n  <input type=\"password\" id=\"key\" placeholder=\"Admin key\" autocomplete=\"off\">\n  <div style=\"height:10px\"></div>\n  <button class=\"btn\" onclick=\"saveKey()\">Open dashboard</button>\n  <div class=\"hint\" id=\"loginErr\"></div>\n</div>\n<div class=\"wrap hidden\" id=\"app\">\n  <h1>BUFF Admin</h1>\n  <div class=\"sub\">X feed to WhatsApp - live control</div>\n\n  <div class=\"card\">\n    <h2>Feed</h2>\n    <div class=\"row\">\n      <div class=\"toggle\" id=\"pauseToggle\" onclick=\"setPaused()\"></div>\n      <div id=\"pauseLabel\">...</div>\n    </div>\n    <div class=\"hint\">Paused = nothing sends, feed keeps collecting. Start = resume from now. Never a backlog dump.</div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Bot power</h2>\n    <div class=\"row\">\n      <button class=\"btn\" id=\"powerBtn\" onclick=\"setPower()\">...</button>\n      <span class=\"hint\" id=\"powerHint\"></span>\n    </div>\n    <div class=\"hint\">OFF = stops polling and suspends the WhatsApp link (full Shabbos mode). ON = resumes. No catch-up either way - it continues from the moment you switch.</div>\n  </div>\n\n  <div class=\"card modes\">\n    <h2>Shabbos</h2>\n    <div class=\"row\">\n      <button data-smode=\"off\" onclick=\"setShabbosMode('off')\">Fully off</button>\n      <button data-smode=\"digest\" onclick=\"setShabbosMode('digest')\">Silent collect + rundown</button>\n    </div>\n    <div class=\"hint\" id=\"smodeHint\"></div>\n  </div>\n\n  <div class=\"card modes\">\n    <h2>Mode</h2>\n    <div class=\"row\">\n      <button data-mode=\"everything\" onclick=\"setMode('everything')\">Everything</button>\n      <button data-mode=\"breaking\" onclick=\"setMode('breaking')\">Breaking news only</button>\n      <button data-mode=\"custom\" onclick=\"setMode('custom')\">Custom (rules)</button>\n    </div>\n    <div class=\"hint\" id=\"modeHint\"></div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Content filters</h2>\n    <table><tbody>\n      <tr><td>Drop bare article-link posts (all accounts)</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgLinks\" onclick=\"setDrop('links')\"></div></td></tr>\n      <tr><td>Drop posts with videos</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgVideo\" onclick=\"setDrop('video')\"></div></td></tr>\n      <tr><td>Drop posts with images</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgImage\" onclick=\"setDrop('image')\"></div></td></tr>\n      <tr><td>Drop posts with GIFs</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgGif\" onclick=\"setDrop('gif')\"></div></td></tr>\n      <tr><td>Media memory (skip media already sent)</td><td style=\"text-align:right\"><div class=\"toggle\" id=\"tgDedup\" onclick=\"setDedup()\"></div></td></tr>\n    </tbody></table>\n    <div class=\"hint\">Logo/boilerplate media is handled by media memory - it stays on unless you switch it off here.</div>\n  </div>\n  <div class=\"hint\" style=\"margin:-4px 0 14px\">Account list is managed on X itself. To mute an account or drop its link-only posts without removing it, text the bot: <b>mute @handle</b>, <b>linkonly @handle</b>.</div>\n\n  <div class=\"card\">\n    <h2>Gatekeeper rules (Gemini)</h2>\n    <div class=\"hint\">One rule per line, plain English. Used in Breaking and Custom modes. Default: deliver breaking news AND major updates to ongoing stories; drop routine commentary, opinion, and link-only posts. If Gemini is unreachable, posts deliver anyway (fail open).</div>\n    <div style=\"height:8px\"></div>\n    <textarea id=\"rules\"></textarea>\n    <div style=\"height:8px\"></div>\n    <div class=\"row\">\n      <button class=\"btn\" onclick=\"saveRules()\">Save rules</button>\n      <input type=\"password\" id=\"gemKey\" placeholder=\"Gemini API key(s) - comma-separated, one per AI Studio project, stored as a Cloudflare secret\" style=\"flex:1\">\n      <button class=\"btn ghost\" onclick=\"saveGemKey()\">Install key</button>\n    </div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Status</h2>\n    <div class=\"stat\"><span>Last poll</span><span id=\"sLastPoll\">-</span></div>\n    <div class=\"stat\"><span>Last error</span><span id=\"sLastError\">-</span></div>\n    <div class=\"stat\"><span>WhatsApp link</span><span id=\"sWa\">-</span></div>\n    <div class=\"stat\"><span>Gemini gatekeeper</span><span id=\"sGem\">-</span></div>\n    <div class=\"stat\"><span>Pending account adds</span><span id=\"sPend\">-</span></div>\n    <div class=\"stat\"><span>Today: delivered / dupes skipped / filtered out</span><span id=\"sVol\">-</span></div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Watches</h2>\n    <div class=\"row\" style=\"margin-bottom:8px\">\n      <input type=\"text\" id=\"watchPhrase\" placeholder=\"Alert me when a post mentions...\" style=\"flex:1\">\n      <button class=\"btn\" onclick=\"addWatch()\">Watch</button>\n    </div>\n    <div id=\"watchList\"></div>\n  </div>\n\n  <div class=\"card\">\n    <h2>Subscribers</h2>\n    <div class=\"row\" style=\"margin-bottom:8px\">\n      <input type=\"text\" id=\"subPhone\" placeholder=\"Phone, e.g. 1443...\" style=\"flex:1\">\n      <button class=\"btn\" onclick=\"addSub()\">Add</button>\n    </div>\n    <table><tbody id=\"subRows\"></tbody></table>\n  </div>\n\n  <div class=\"card\">\n    <h2>Access</h2>\n    <div class=\"hint\">Change the dashboard key. Anyone with the key can control the feed - keep it private.</div>\n    <div style=\"height:8px\"></div>\n    <input type=\"password\" id=\"curKey\" placeholder=\"Current key\">\n    <div style=\"height:8px\"></div>\n    <input type=\"password\" id=\"newKey\" placeholder=\"New key (8+ characters)\">\n    <div style=\"height:8px\"></div>\n    <button class=\"btn\" onclick=\"changeKey()\">Change key</button>\n    <span class=\"hint\" id=\"keyMsg\"></span>\n  </div>\n</div>\n<script>\nlet KEY = localStorage.getItem('buff_admin_key') || '';\nasync function api(path, body) {\n  const res = await fetch('/admin/api' + path, {\n    method: body ? 'POST' : 'GET',\n    headers: { 'content-type': 'application/json', 'x-admin-key': KEY },\n    body: body ? JSON.stringify(body) : undefined\n  });\n  if (res.status === 401) { showLogin('Wrong key.'); throw new Error('401'); }\n  return res.json();\n}\nfunction showLogin(err) {\n  document.getElementById('login').classList.remove('hidden');\n  document.getElementById('app').classList.add('hidden');\n  document.getElementById('loginErr').textContent = err || '';\n}\nfunction saveKey() {\n  KEY = document.getElementById('key').value.trim();\n  localStorage.setItem('buff_admin_key', KEY);\n  load();\n}\nfunction esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }\nasync function load() {\n  let s;\n  try { s = await api('/state'); } catch (e) { return; }\n  document.getElementById('login').classList.add('hidden');\n  document.getElementById('app').classList.remove('hidden');\n  const pt = document.getElementById('pauseToggle');\n  pt.classList.toggle('on', !s.paused);\n  document.getElementById('pauseLabel').innerHTML = s.paused ? '<b class=\"bad\">PAUSED</b> - tap to resume' : '<b class=\"ok\">RUNNING</b> - tap to pause';\n  document.querySelectorAll('.modes button').forEach(b => b.classList.toggle('active', b.dataset.mode === s.mode));\n  document.querySelectorAll('[data-smode]').forEach(b => b.classList.toggle('active', b.dataset.smode === (s.shabbosMode || 'off')));\n  document.getElementById('smodeHint').textContent = (s.shabbosMode === 'digest') ? 'Collects silently during Shabbos, then sends one sectioned rundown after havdalah.' : 'Fully dark from candle-lighting to havdalah - no collecting, nothing sent. Resumes live after.';\n  document.getElementById('modeHint').textContent =\n    s.mode === 'everything' ? 'Everything delivers (muted/link-only filters still apply). Gemini is bypassed.' :\n    s.mode === 'breaking' ? 'Gemini passes only breaking news and event footage, plus your always-deliver rules.' :\n    'Gemini judges every post against your rules below.';\n  const pb = document.getElementById('powerBtn');\n  pb.textContent = s.power === 'off' ? 'Turn bot ON' : 'Turn bot OFF';\n  pb.style.background = s.power === 'off' ? 'var(--green)' : 'var(--red)';\n  pb.style.color = s.power === 'off' ? '#04101f' : '#fff';\n  document.getElementById('powerHint').textContent = s.power === 'off' ? 'Bot is fully OFF.' : 'Bot is on.' + (s.powerConfigured ? '' : ' (power control not wired yet)');\n  document.getElementById('sLastPoll').textContent = s.lastPoll || 'never';\n  document.getElementById('sLastError').textContent = s.lastError || 'none';\n  document.getElementById('sWa').innerHTML = s.waDown ? '<b class=\"bad\">down</b>' : '<b class=\"ok\">connected</b>';\n  document.getElementById('sGem').textContent = s.gemini + (s.geminiUsage != null ? ' (' + s.geminiUsage + ' calls today)' : '');\n  document.getElementById('sPend').textContent = s.pendingAdds.length ? s.pendingAdds.map(p => '@' + p.handle).join(', ') : 'none';\n  document.getElementById('rules').value = (s.rules || []).join('\\n');\n  const d = s.drop || {};\n  document.getElementById('tgLinks').classList.toggle('on', !!(d.links || s.linkOnlyAll));\n  document.getElementById('tgVideo').classList.toggle('on', !!d.video);\n  document.getElementById('tgImage').classList.toggle('on', !!d.image);\n  document.getElementById('tgGif').classList.toggle('on', !!d.gif);\n  document.getElementById('tgDedup').classList.toggle('on', !s.dedupOff);\n  const v = s.volume || {};\n  document.getElementById('sVol').textContent = (v.delivered||0) + ' / ' + (v.suppressed||0) + ' / ' + (v.filtered||0);\n  if (s.pendingRemovals && s.pendingRemovals.length) document.getElementById('sPend').textContent += ' | queued X-removals: ' + s.pendingRemovals.map(p => '@' + p.handle).join(', ');\n  document.getElementById('watchList').innerHTML = (s.watches || []).map(w =>\n    '<span class=\"chip\">' + esc(w.phrase) + ' <button onclick=\"delWatch(\\'' + esc(w.phrase) + '\\')\">&times;</button></span>').join('') || '<span class=\"hint\">None.</span>';\n  document.getElementById('subRows').innerHTML = (s.subscribers || []).map(p =>\n    '<tr><td>' + esc(p.phone) + (p.paused ? ' <span class=\"muted-h\">(paused)</span>' : '') + '</td>' +\n    '<td style=\"text-align:right\"><button class=\"btn danger\" onclick=\"delSub(\\'' + esc(p.phone) + '\\')\">Remove</button></td></tr>').join('') || '<tr><td class=\"muted-h\">None.</td></tr>';\n}\nasync function setPaused() { const s = await api('/state'); await api('/pause', { paused: !s.paused }); load(); }\nasync function setMode(m) { await api('/mode', { mode: m }); load(); }\nasync function saveRules() { await api('/rules', { rules: document.getElementById('rules').value.split('\\n').map(x => x.trim()).filter(Boolean) }); load(); }\nasync function saveGemKey() { const k = document.getElementById('gemKey').value.trim(); if (!k) return; await api('/gemini-key', { key: k }); document.getElementById('gemKey').value = ''; load(); }\nasync function addWatch() { const p = document.getElementById('watchPhrase').value.trim(); if (!p) return; await api('/watch-add', { phrase: p }); document.getElementById('watchPhrase').value = ''; load(); }\nasync function delWatch(p) { await api('/watch-del', { phrase: p }); load(); }\nasync function addSub() { const p = document.getElementById('subPhone').value.trim(); if (!p) return; await api('/sub-add', { phone: p }); document.getElementById('subPhone').value = ''; load(); }\nasync function delSub(p) { await api('/sub-del', { phone: p }); load(); }\nasync function setDrop(k) { const s = await api('/state'); const d = s.drop || {}; const body = {}; body[k] = !(k === 'links' ? (d.links || s.linkOnlyAll) : d[k]); await api('/drop', body); load(); }\nasync function setDedup() { const s = await api('/state'); await api('/dedup', { off: !s.dedupOff }); load(); }\nasync function changeKey() {\n  const msg = document.getElementById('keyMsg');\n  const res = await fetch('/admin/api/admin-key', { method: 'POST', headers: { 'content-type': 'application/json', 'x-admin-key': KEY }, body: JSON.stringify({ current: document.getElementById('curKey').value, next: document.getElementById('newKey').value }) });\n  const j = await res.json().catch(() => ({}));\n  if (res.ok && j.ok) { KEY = document.getElementById('newKey').value; localStorage.setItem('buff_admin_key', KEY); msg.textContent = 'Key changed - you are now using the new key.'; }\n  else msg.textContent = j.error || 'Failed.';\n}\nasync function setShabbosMode(m) { await api('/shabbos-mode', { mode: m }); load(); }\nasync function setPower() { const s = await api('/state'); const on = s.power === 'off'; if (!confirm(on ? 'Turn the bot ON? It resumes from now, no catch-up.' : 'Turn the bot fully OFF? Polling stops and the WhatsApp link suspends.')) return; const r = await api('/power', { on }); if (!r.ok) alert('Power switch had a problem: ' + JSON.stringify(r.steps)); load(); }\nif (KEY) load(); else showLogin();\n</script>\n</body>\n</html>\n";
 
 
 const XRELOGIN_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>BUFF - Reconnect X</title>
