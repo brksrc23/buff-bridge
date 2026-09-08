@@ -326,6 +326,7 @@ const server = http.createServer(async (req, res) => {
       qrAvailable: !registered && !!lastQR, qrAt: lastQRAt,
       kv: kvStatus(), dedup: dedupStatus(), user: sock?.user?.id || null,
       workerPoll: { lastAt: lastWorkerPollAt || null, ageSec: lastWorkerPollAt ? Math.round((Date.now() - lastWorkerPollAt) / 1000) : null },
+      mem: (() => { const m = process.memoryUsage(); return { rssMB: +(m.rss / 1048576).toFixed(1), heapUsedMB: +(m.heapUsed / 1048576).toFixed(1), heapTotalMB: +(m.heapTotal / 1048576).toFixed(1) }; })(), // v6: RSS visibility for 512Mi OOM watch
       bandwidth: { day: stats.day, bytesDay: stats.bytesDay, msgsDay: stats.msgsDay,
                    month: stats.month, bytesMonth: stats.bytesMonth, msgsMonth: stats.msgsMonth,
                    estMBMonth: +(stats.bytesMonth / 1e6).toFixed(1), note: 'estimate: media upload size + text + 1KB/msg overhead; KV flush bytes in kv.flushedBytesTotal; authoritative figure is Render dashboard > Billing' }
