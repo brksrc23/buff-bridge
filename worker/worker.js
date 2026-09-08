@@ -1422,7 +1422,11 @@ async function geminiClassify(env, keyIgnored, rules, mode, tweets, acctRules, r
       }
       lastStatus = (r && r.status) || 0; lastBody = (r && r.body) || "";
       if (lastStatus === 429) {
-        const daily = /limit:\s*500|PerDay/i.test(lastBody);
+        // v47d (2026-09-08 live-incident): the old regex matched "PerDay" anywhere in the 429 body -
+        // Gemini lists several quota metrics in every 429, so a per-MINUTE burst parked a healthy key
+        // until PT midnight (today's 4:28 PM false daily-cool, 3h of dead feed during a live event).
+        // Daily only when a PerDay metric is present AND no PerMinute metric is (minute bursts cool 5 min).
+        const daily = /PerDay/i.test(lastBody) && !/PerMinute/i.test(lastBody);
         await gemKeyCool(env, kid, daily ? nextPTmidnight() : Date.now() + 5 * 60000, daily, lastBody);
         continue; // next key in the pool
       }
