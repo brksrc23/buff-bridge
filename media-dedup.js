@@ -85,8 +85,8 @@ async function videoHashes(buf) {
     const m = /Duration: (\d+):(\d+):([\d.]+)/.exec(probe.stderr);
     const dur = m ? (+m[1] * 3600 + +m[2] * 60 + +m[3]) : 0;
     const ats = dur > 2 ? [dur * 0.15, dur * 0.5, dur * 0.85] : [0.5, 1.5, 3];
-    const frames = await Promise.all(ats.map((t) =>
-      runFFmpeg(['-ss', t.toFixed(2), '-i', tmp, '-an', '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'png', '-'])));
+    const frames = []; // v5: sequential, not parallel - 3 concurrent ffmpeg decodes + the whole video in heap OOM-killed the 512Mi instance (2026-09-08 crash loop)
+    for (const t of ats) frames.push(await runFFmpeg(['-v', 'error', '-ss', t.toFixed(2), '-i', tmp, '-vf', 'scale=144:-2', '-an', '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'png', '-']));
     const hashes = [];
     for (const r of frames) {
       if (!r.stdout.length) continue;
@@ -174,6 +174,11 @@ export async function checkMedia({ imageUrl, videoUrl }) {
   try {
     const r = await fetch(url, { signal: AbortSignal.timeout(20000) });
     if (!r.ok) throw new Error('media GET ' + r.status);
+    // v5 OOM guards (2026-09-08 crash loop): big videos buffered whole in heap killed the 512Mi instance.
+    // Skip hashing - fail-open (media still sends; worker-side byte-exact URL dedup still applies).
+    const clen = Number(r.headers.get('content-length') || 0);
+    if (kind === 'vid' && clen > 12 * 1024 * 1024) { stats.bigSkips = (stats.bigSkips || 0) + 1; console.log(`[dedup] SKIP big video ${(clen / 1048576).toFixed(1)}MB tag=${tag} (OOM guard)`); return { dupe: false }; }
+    if (process.memoryUsage().rss > 420 * 1024 * 1024) { stats.memSkips = (stats.memSkips || 0) + 1; console.log(`[dedup] SKIP hashing under memory pressure tag=${tag}`); return { dupe: false }; }
     const buf = Buffer.from(await r.arrayBuffer());
     if (kind === 'img') {
       const h = await dhashBuffer(buf);
