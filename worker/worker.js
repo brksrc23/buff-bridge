@@ -600,7 +600,10 @@ async function deliverTweet(env, t) {
     toSend.push(m);
   }
   const fold = body.length <= 1000;
+  // v47b (approved 2026-09-08 16:25): over-cap posts fold a truncated ~990-char lead + "..." as the
+  // caption so photo and text stay visually connected (Ezra's 3:59 PM split-photo); full text still follows.
   let caption = fold ? body : null;
+  if (!fold) { const cut = body.slice(0, 990); const sp = cut.lastIndexOf(" "); caption = (sp > 600 ? cut.slice(0, sp) : cut).trimEnd() + "..."; }
   // v47a (bridge v7 album consolidation): the whole media set goes in ONE /send call - the bridge
   // dedups per item and delivers survivors as a single WhatsApp album with the caption on the first.
   // Same caption-migration contract as before: mediaDupe in the response means every media was
@@ -694,7 +697,10 @@ async function saveBS(env, bs, force) {
   bs.savedAt = Date.now();
   const out = { ...bs };
   delete out.dirty; delete out.seenSet;
-  const ok = await kvPut(env, BS_KEY, JSON.stringify(out));
+  let ok = await kvPut(env, BS_KEY, JSON.stringify(out));
+  // v47b (approved 2026-09-08 16:25): one immediate retry on transient put failure - a silently failed
+  // delivery-tick save left state unsaved for 28 min on 9/8, exposing the 45-min cold-guard cliff.
+  if (!ok) { await new Promise((r) => setTimeout(r, 300)); ok = await kvPut(env, BS_KEY, JSON.stringify(out)); }
   if (ok) bs.dirty = false;
   return ok;
 }
