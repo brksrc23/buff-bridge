@@ -158,7 +158,7 @@ async function kvFlush(force) {
 
 export async function initDedup() {
   await kvRestore();
-  setInterval(() => kvFlush(false), 5 * 60 * 1000).unref(); // slow dirty flush; KV write budget safe (~12/hr max, only when dirty)
+  setInterval(() => kvFlush(false), 15 * 60 * 1000).unref(); // v6: slow dirty flush; KV write budget safe (~4/hr max, only when dirty)
   const onExit = () => kvFlush(true).finally(() => process.exit(0));
   process.on('SIGTERM', onExit); // kv-auth-store has its own; both run
   process.on('SIGINT', onExit);
