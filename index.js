@@ -253,15 +253,19 @@ async function sendAlbum(jid, text, items, opts) {
   let captionPending = text || null; // post text rides the first item as the album caption
   for (const it of items) {
     const content = it.kind === 'image' ? { image: { url: it.url } } : { video: { url: it.url } };
-    if (captionPending) { content.caption = captionPending; captionPending = null; }
+    if (captionPending) content.caption = captionPending;
     if (parentKey) content.albumParentKey = parentKey;
     try {
       const res = await sock.sendMessage(jid, content, opts);
+      if (captionPending) captionPending = null; // v7a: consume only on success - a failed item migrates the caption to the next
       if (!firstId && res && res.key) firstId = res.key.id;
     } catch (e) {
       console.error('[album] item send failed, continuing with rest:', e.message);
     }
     await new Promise((r) => setTimeout(r, 300));
+  }
+  if (captionPending) { // v7a (approved 2026-09-08 16:25): every item failed - never lose the text silently
+    try { await sock.sendMessage(jid, { text: captionPending }, opts); } catch (e) { console.error('[album] caption text fallback failed:', e.message); }
   }
   return firstId;
 }
@@ -269,6 +273,8 @@ async function sendAlbum(jid, text, items, opts) {
 async function sendToRecipient({ text, imageUrl, videoUrl, mediaUrls, quoteId, to }) {
   const jid = ((to || RECIPIENT) + '').replace(/\D/g, '') + '@s.whatsapp.net';
   let content;
+  // v7a: send-path log so caption/album behavior is verifiable from Render logs
+  console.log('[send]', Array.isArray(mediaUrls) && mediaUrls.length > 1 ? 'album items=' + mediaUrls.length : (Array.isArray(mediaUrls) && mediaUrls.length === 1 ? (mediaUrls[0].kind === 'image' ? 'image' : 'video') : (imageUrl ? 'image' : videoUrl ? 'video' : 'text')), 'textLen=' + (text ? text.length : 0));
   // v7: multi-media posts go as one album (1 chat entry). Single media keeps the v3 caption-fold path.
   if (Array.isArray(mediaUrls) && mediaUrls.length > 1) {
     const opts0 = quoteId ? { quoted: { key: { id: quoteId, remoteJid: jid, fromMe: true } } } : {};
