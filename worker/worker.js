@@ -618,10 +618,11 @@ async function deliverTweet(env, t) {
 // instead of dying mid-tick, so polling/classification/digest continue (state just doesn't persist until reset).
 let KV_DEAD_UNTIL = 0;
 const RECENT_CLASSIFIED = new Set(); // isolate-local: backs up the gem:<id> KV cache while writes are degraded
+const UNJUDGED_BACKOFF = new Map(); // v47: id -> { n, next } - escalating backoff on classifier-dead candidates (2026-09-08 neuron-cap retry storm)
 async function kvPut(env, key, value, opts) {
   if (Date.now() < KV_DEAD_UNTIL) return false;
   try { await env.BUFF_KV.put(key, value, opts); return true; }
-  catch (e) { if (String(e && e.message || e).includes("limit exceeded")) KV_DEAD_UNTIL = Date.now() + 5 * 60 * 1000; return false; }
+  catch (e) { if (/limit exceeded|10048|429|usage limit/i.test(String(e && e.message || e))) KV_DEAD_UNTIL = Date.now() + 5 * 60 * 1000; return false; } // v47: catch the 429/10048 shape too (yesterday's cap-trip kept retrying failed writes)
 }
 
 async function getJSON(env, key, fallback) {
@@ -659,6 +660,34 @@ async function loadBS(env) {
 async function saveBS(env, bs, force) {
   if (!bs.dirty && !force) return false;
   if (!force && Date.now() - (bs.savedAt || 0) < BS_SAVE_MIN_MS) return false;
+  // v47 merge-at-save: union with the persisted blob before writing, so a stale warm isolate can't clobber newer
+  // state (2026-09-07 flood root + the gemCalls/recentDel counter wobble). One extra read per save; reads are cheap.
+  try {
+    const curRaw = await env.BUFF_KV.get(BS_KEY);
+    const cur = curRaw ? JSON.parse(curRaw) : null;
+    if (cur && cur.v === 1 && Array.isArray(cur.seen)) {
+      const seenSet = new Set();
+      const seenOrdered = [];
+      for (const id of [...cur.seen, ...bs.seen]) { if (!seenSet.has(id)) { seenSet.add(id); seenOrdered.push(id); } }
+      bs.seen = seenOrdered.slice(-1500); bs.seenSet = new Set(bs.seen);
+      for (const k of Object.keys(cur.gem || {})) { const lv = bs.gem[k]; if (!lv || (cur.gem[k].at || 0) > (lv.at || 0)) bs.gem[k] = cur.gem[k]; }
+      for (const k of Object.keys(cur.media || {})) { if (!bs.media[k]) bs.media[k] = cur.media[k]; }
+      const rdMap = new Map();
+      for (const x of [...(cur.recentDel || []), ...(bs.recentDel || [])]) { if (x && x.t) rdMap.set(String(x.t).slice(0, 120) + "@" + Math.floor((x.at || 0) / 120000), x); }
+      bs.recentDel = [...rdMap.values()].sort((a, b) => a.at - b.at).filter((x) => Date.now() - x.at < 6 * 3600 * 1000).slice(-40);
+      const day = new Date().toISOString().slice(0, 10);
+      for (const f of ["gemCalls", "waiCalls"]) {
+        const a = cur[f], b = bs[f];
+        if (a && a.day === day && b && b.day === day) bs[f] = { day, n: Math.max(a.n || 0, b.n || 0) };
+        else if (a && a.day === day && (!b || b.day !== day)) bs[f] = a;
+      }
+      if ((cur.lastDone || "") > (bs.lastDone || "")) bs.lastDone = cur.lastDone;
+      if ((cur.lastPoll || "") > (bs.lastPoll || "")) bs.lastPoll = cur.lastPoll;
+      const sentMap = new Map();
+      for (const s of [...(cur.sent || []), ...(bs.sent || [])]) sentMap.set(JSON.stringify(s), s);
+      bs.sent = [...sentMap.values()].slice(-400);
+    }
+  } catch (e) {}
   bs.savedAt = Date.now();
   const out = { ...bs };
   delete out.dirty; delete out.seenSet;
@@ -915,6 +944,8 @@ async function poll(env, maxDeliver, diag) {
       const candidates = [];
       for (let i = 0; i < pre.length; i++) {
         if (bsGemGet(bs, pre[i].id) !== null) continue;
+        const bo = UNJUDGED_BACKOFF.get(String(pre[i].id));
+        if (bo && Date.now() < bo.next) continue; // v47: classifier was dead for this id recently - back off, don't re-storm
         candidates.push(pre[i]);
         if (candidates.length >= cap) break;
       }
@@ -925,6 +956,7 @@ async function poll(env, maxDeliver, diag) {
         if (!verdicts) verdicts = await waiClassify(env, rules, feedMode, candidates, acctRules, (bs.recentDel || []).map((x) => x.t)); // v42: Workers AI net, only when Gemini is out
         mark("tClassify");
         if (verdicts) for (const [vid, gv] of verdicts) bsGemSet(bs, vid, gv); // null = Gemini unreachable: hold candidates, retry next tick
+        else for (const c of candidates) { const k = String(c.id); const b = UNJUDGED_BACKOFF.get(k) || { n: 0, next: 0 }; b.n++; b.next = Date.now() + [5, 15, 30, 60][Math.min(b.n - 1, 3)] * 60000; UNJUDGED_BACKOFF.set(k, b); } // v47: 5/15/30/60-min escalation - breaks the every-90s re-classify storm that ate 10k neurons in 67 min
       }
     }
   }
@@ -1319,6 +1351,9 @@ function parseGem(v) {
 async function waiClassify(env, rules, mode, tweets, acctRules, recent) {
   try {
     if (!env.BRIDGE_SECRET || !env.BRIDGE_URL) return null;
+    const day0 = new Date().toISOString().slice(0, 10);
+    const bsT = await loadBS(env);
+    if (bsT.waiCalls && bsT.waiCalls.day === day0 && bsT.waiCalls.n >= 190) return null; // v47: neuron self-throttle (~190 calls ~ 7k of 10k/day free) - stop before the cap, not after
     // Route via the Render bridge: same-account workers.dev subrequests from this worker are blocked (404/1042),
     // and the API token silently drops service/ai bindings on this script. Bridge -> judge is an external hop.
     const res = await fetch(env.BRIDGE_URL.replace(/\/$/, "") + "/judge", {
@@ -1329,7 +1364,10 @@ async function waiClassify(env, rules, mode, tweets, acctRules, recent) {
     });
     if (!res.ok) { try { const msg = `${new Date().toISOString()} workers-ai judge HTTP ${res.status}`; const prev = await env.BUFF_KV.get("last_error"); if (!prev || prev.slice(24) !== msg.slice(24)) await kvPut(env, "last_error", msg); } catch (e0) {} return null; }
     const j = await res.json();
-    if (!j || !Array.isArray(j.verdicts) || !j.verdicts.length) return null;
+    if (!j || !Array.isArray(j.verdicts) || !j.verdicts.length) {
+      try { if (j && j.err) { const msg = `${new Date().toISOString()} judge verdicts:null: ${String(j.err).slice(0, 100)}`; const prev = await env.BUFF_KV.get("last_error"); if (!prev || prev.slice(24) !== msg.slice(24)) await kvPut(env, "last_error", msg); } } catch (e0) {} // v47: this failure was invisible 2026-09-08 (neuron cap read as 4h of "quiet")
+      return null;
+    }
     const verdicts = new Map();
     for (const pair of j.verdicts) if (Array.isArray(pair) && pair[0] != null && pair[1] && typeof pair[1].d === "boolean") verdicts.set(String(pair[0]), { d: pair[1].d, r: "wai" });
     if (!verdicts.size) return null;
@@ -1951,6 +1989,18 @@ export default {
         if (url.searchParams.get("wai")) { // v42 probe: is the Workers AI fallback judge reachable?
           const r = await waiClassify(env, ["Deliver only urgent breaking news about wars, disasters, or major attacks.", "When in doubt, DROP."], "breaking", [{ id: "probe1", handle: "testfeed", kind: "post", media: [], text: "Sunny skies and mild temperatures expected across the region today." }, { id: "probe2", handle: "testfeed", kind: "post", media: [], text: "BREAKING: Massive explosion reported at a port facility, multiple casualties confirmed, emergency crews responding." }], {}, []);
           return Response.json({ waiReachable: r !== null, verdicts: r ? [...r] : null, bridgeAuthBound: !!env.BRIDGE_SECRET });
+        }
+        if (url.searchParams.get("classifyprobe")) { // v47: on-demand A/B - classify POSTed tweets with BOTH rails, no state changes, no delivery
+          const body = await request.json().catch(() => ({}));
+          const tw = Array.isArray(body.tweets) ? body.tweets.slice(0, 15) : [];
+          if (!tw.length) return Response.json({ error: "POST { tweets: [...] } (max 15)" }, { status: 400 });
+          const rules = await getRules(env);
+          const mode = await getMode(env);
+          const acctRules = await getAcctRules(env);
+          const g = await geminiClassify(env, null, rules, mode, tw, acctRules, []);
+          const w = await waiClassify(env, rules, mode, tw, acctRules, []);
+          const ser = (m) => (m ? Object.fromEntries([...m].map(([k, v]) => [k, v])) : null);
+          return Response.json({ mode, n: tw.length, gemini: ser(g), wai: ser(w) });
         }
         // v37b: the bridge-side poller (cron-throttle fallback) calls this around the clock - it must not wake
         // the feed during a full-off Shabbos window (same early-return as the cron handler; digest mode collects silently)
