@@ -11,7 +11,7 @@ const TOKEN = process.env.CF_API_TOKEN;
 const KV_KEY = process.env.KV_KEY || 'bridge:auth';
 
 const DEBOUNCE_MS = 15000;   // write this long after the last fs change
-const MIN_INTERVAL_MS = 30000; // never PUT more often than this
+const MIN_INTERVAL_MS = 900000; // v6: never PUT more often than this (15-min auth flush cap, KV write budget)
 const API = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT}/storage/kv/namespaces/${NAMESPACE}/values`;
 
 let dirty = false;
