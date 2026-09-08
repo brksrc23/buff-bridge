@@ -601,12 +601,15 @@ async function deliverTweet(env, t) {
   }
   const fold = body.length <= 1000;
   let caption = fold ? body : null;
-  for (const m of toSend) {
-    const payload = m.kind === "image" ? { imageUrl: m.url } : { videoUrl: m.url };
+  // v47a (bridge v7 album consolidation): the whole media set goes in ONE /send call - the bridge
+  // dedups per item and delivers survivors as a single WhatsApp album with the caption on the first.
+  // Same caption-migration contract as before: mediaDupe in the response means every media was
+  // suppressed, so the text still goes standalone.
+  if (toSend.length) {
+    const payload = { mediaUrls: toSend.map((m) => ({ kind: m.kind, url: m.url })) };
     if (caption) payload.text = caption;
     const r = await deliverToAll(env, payload);
     if (caption && !(r && r.mediaDupe)) caption = null;
-    await sleep(250);
   }
   if (caption || !fold) await deliverToAll(env, { text: body });
   return { suppressed, untranslated: 0 };
