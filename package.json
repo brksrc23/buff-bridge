@@ -13,7 +13,9 @@
     "@whiskeysockets/baileys": "file:vendor/whiskeysockets-baileys-7.0.0-rc14.tgz",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
-    "jimp": "^1.6.1",
+    "jimp": "^1.6.1"
+  },
+  "optionalDependencies": {
     "ffmpeg-static": "^5.2.0"
   }
 }
