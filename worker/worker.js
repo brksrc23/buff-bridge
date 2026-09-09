@@ -922,6 +922,7 @@ async function poll(env, maxDeliver, diag) {
   const holding = paused || waDown; // deliveries off: still collect, mark seen, retain for queries - resume from NOW, never a backlog dump
 
   let delivered = 0, dropped = 0, deferred = 0, filtered = 0, suppressed = 0, untranslated = 0;
+  let markerDupes = 0; // v47e
   // Gemini gatekeeper: batch-classify this tick's delivery candidates (max 10/tick, cached per tweet). FAIL-OPEN.
   let preDupes = null; // v36
   const feedMode = await getMode(env);
@@ -1051,6 +1052,11 @@ async function poll(env, maxDeliver, diag) {
           continue;
       }
     } catch (e) { fp = null; }
+    // v47e cross-isolate send dedup (2026-09-08 dup flood): the blob seen-set only propagates on
+    // coalesced saves, so the bridge poller and the cron fallback (v38 lease reads stale lastPoll)
+    // could both deliver the same id minutes apart. Per-id KV marker: checked right before send,
+    // written right after. Edge cache bounds the residual window to ~60s.
+    try { if (await env.BUFF_KV.get("sent_" + id)) { bsSeenAdd(bs, id); markerDupes++; continue; } } catch (e) {}
     try {
       const dres = await deliverTweet(env, t);
       suppressed += dres.suppressed;
@@ -1068,6 +1074,7 @@ async function poll(env, maxDeliver, diag) {
       }
       bsSeenAdd(bs, id); // mark seen only AFTER successful send
       delivered++;
+      try { await env.BUFF_KV.put("sent_" + id, "1", { expirationTtl: 86400 }); } catch (e) {} // v47e
       try { // rolling "already delivered" memory for the gatekeeper (restatement-drop context)
         bs.recentDel = bs.recentDel || [];
         bs.recentDel.push({ t: String(t.text || t.origText || "").replace(/\s+/g, " ").slice(0, 140), at: Date.now() });
@@ -1111,7 +1118,7 @@ async function poll(env, maxDeliver, diag) {
   const forceSave = delivered > 0 && Date.now() - LAST_FORCE_SAVE > 120000; // v46: force-persist at most every 2 min on delivery ticks (was every delivery - KV write budget); regular 10-min throttle otherwise
   if (forceSave) LAST_FORCE_SAVE = Date.now();
   await saveBS(env, bs, forceSave);
-  return `delivered=${delivered} dropped=${dropped} skipped=${skipped} filtered=${filtered} deferred=${deferred} suppressed=${suppressed}${untranslated ? ` untr=${untranslated}` : ""}${storyDupes ? ` storydupes=${storyDupes}` : ""}${held ? ` held=${held}` : ""}${shabbos ? " shabbos" : ""}${paused ? " paused" : ""}${waDown ? " wa_down" : ""}`;
+  return `delivered=${delivered} dropped=${dropped} skipped=${skipped} filtered=${filtered} deferred=${deferred} suppressed=${suppressed}${markerDupes ? ` markerdupes=${markerDupes}` : ""}${untranslated ? ` untr=${untranslated}` : ""}${storyDupes ? ` storydupes=${storyDupes}` : ""}${held ? ` held=${held}` : ""}${shabbos ? " shabbos" : ""}${paused ? " paused" : ""}${waDown ? " wa_down" : ""}`;
 }
 
 // ---------- commands ----------
