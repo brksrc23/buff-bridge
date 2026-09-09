@@ -443,7 +443,7 @@ const server = http.createServer(async (req, res) => {
     let payload;
     try { payload = JSON.parse(body); } catch { return reply(400, { error: 'bad json' }); }
     // transport dedupe: collapse identical sends within 15 min (overlapping poll ticks, duplicate cron events)
-    const fp = createHash('sha1').update(String(payload.to || '') + '|' + (payload.text || '') + '|' + (payload.imageUrl || '') + '|' + (payload.videoUrl || '') + '|' + JSON.stringify(payload.mediaUrls || '')).digest('hex');
+    const fp = createHash('sha1').update(String(payload.to || '') + '|' + String(payload.id || '') + '|' + (payload.text || '') + '|' + (payload.imageUrl || '') + '|' + (payload.videoUrl || '') + '|' + JSON.stringify(payload.mediaUrls || '')).digest('hex'); // v10: item id collapses same-item replays even when media/text shape differs (Herzog dup 2026-09-09)
     const now = Date.now();
     for (const [k, t] of recentSends) if (now - t > 15 * 60 * 1000) recentSends.delete(k);
     if (recentSends.has(fp)) return reply(200, { id: null, dupe: true });
@@ -493,18 +493,21 @@ server.listen(PORT, HOST, () => {
 // the worker ping our /health, which also keeps this free-tier instance warm when cron is dead. The worker
 // honors the full-off Shabbos window and the power switch itself suspends this service, so both stay absolute.
 let pollInFlight = false;
+let pollHoldUntil = 0; // v10: after an abort/timeout the worker's server-side work is STILL RUNNING - hold polls 4 min so a retry can't overlap it (Herzog same-id dup 2026-09-09)
 let lastWorkerPollAt = 0; // v38 single-poller lease: cron reads this via /status and only polls when we go stale
 async function pollWorker() {
-  if (!WORKER_URL || !SECRET || pollInFlight) return;
+  if (!WORKER_URL || !SECRET || pollInFlight || Date.now() < pollHoldUntil) return;
   pollInFlight = true;
   try {
-    const r = await fetch(WORKER_URL + '/poll-now?key=' + encodeURIComponent(SECRET), { signal: AbortSignal.timeout(60000) });
+    const r = await fetch(WORKER_URL + '/poll-now?key=' + encodeURIComponent(SECRET), { signal: AbortSignal.timeout(150000) }); // v10: 150s - past worst-case cold-start processing so legit polls stop aborting
     const j = await r.json().catch(() => null);
     if (j && typeof j.result === 'string') lastWorkerPollAt = Date.now();
     const result = (j && j.result) || ('HTTP ' + r.status);
     if (!/^delivered=0 dropped=0/.test(result)) console.log('worker poll:', result); // quiet ticks stay quiet in the logs
+    pollHoldUntil = 0;
   } catch (e) {
-    console.error('worker poll failed:', String((e && e.message) || e));
+    pollHoldUntil = Date.now() + 4 * 60 * 1000;
+    console.error('worker poll failed (holding polls 4 min - server-side work may still be running):', String((e && e.message) || e));
   } finally {
     pollInFlight = false;
   }
