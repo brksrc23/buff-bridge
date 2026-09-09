@@ -409,6 +409,30 @@ const server = http.createServer(async (req, res) => {
     });
     return;
   }
+  // v9: /diag/burst?key=PAIR_KEY - RAM gate for the 256MB free-plan cap. Runs the REAL
+  // media path (fetch + jimp dHash album + ffmpeg video keyframes), no WhatsApp send.
+  if (req.method === 'GET' && reqUrl.pathname === '/diag/burst') {
+    const key = reqUrl.searchParams.get('key') || '';
+    if (!PAIR_KEY || key !== PAIR_KEY) return reply(403, { error: 'bad key' });
+    const rss = () => Math.round(process.memoryUsage().rss / 104857.6) / 10;
+    const before = rss();
+    let peak = before;
+    const watch = setInterval(() => { const r = rss(); if (r > peak) peak = r; }, 50);
+    const t0 = Date.now();
+    const results = [];
+    try {
+      for (let i = 0; i < 4; i++) {
+        const r = await checkMedia({ imageUrl: 'https://picsum.photos/seed/burst' + Date.now() + i + '/1200/800' });
+        results.push({ img: i, dupe: r && r.dupe });
+      }
+      const v = await checkMedia({ videoUrl: 'https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/1080/Big_Buck_Bunny_1080_10s_5MB.mp4' });
+      results.push({ video: true, dupe: v && v.dupe });
+    } catch (e) { results.push({ error: String(e && e.message || e) }); }
+    clearInterval(watch);
+    const after = rss();
+    if (after > peak) peak = after;
+    return reply(200, { before, after, peak, ms: Date.now() - t0, results, capMB: 256, headroomMB: Math.round((256 - peak) * 10) / 10 });
+  }
   if (req.method !== 'POST' || reqUrl.pathname !== '/send') return reply(404, { error: 'not found' });
   if (req.headers.authorization !== SECRET) return reply(401, { error: 'bad auth' });
 
