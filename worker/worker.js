@@ -788,6 +788,17 @@ function passesFilters(t, filters) {
 
 // ---------- poll ----------
 
+// v47f rule-based pre-filter (GO 2026-09-09 parent): deterministic junk drop BEFORE classify - quality
+// filtering, NOT a rate cap. Mirrors gatekeeper rules 5-6: weather non-warnings (watch/outlook/forecast/
+// discussion/advisory) and explicit opinion/analysis markers never reach the classifier. Conservative by
+// design: anything ambiguous still classifies. Bare links are already dropped upstream by passesFilters.
+function isPreFilterJunk(s) {
+  const x = String(s || "").toLowerCase();
+  if (/\b(tornado|thunderstorm|flash flood|hurricane|winter storm|blizzard|nws|spc|weather)\b/.test(x) && /\b(watch|outlook|forecast|discussion|advisory)\b/.test(x) && !/\bwarning\b/.test(x)) return true;
+  if (/(op-?ed|opinion:|commentary:|analysis:|editorial)/i.test(s)) return true;
+  return false;
+}
+
 async function poll(env, maxDeliver, diag) {
   const d = diag || null;
   const mark = (k) => { if (d) d[k] = Date.now() - d._t0; };
@@ -923,6 +934,7 @@ async function poll(env, maxDeliver, diag) {
 
   let delivered = 0, dropped = 0, deferred = 0, filtered = 0, suppressed = 0, untranslated = 0;
   let markerDupes = 0; // v47e
+  let preFiltered = 0; // v47f
   // Gemini gatekeeper: batch-classify this tick's delivery candidates (max 10/tick, cached per tweet). FAIL-OPEN.
   let preDupes = null; // v36
   const feedMode = await getMode(env);
@@ -941,6 +953,7 @@ async function poll(env, maxDeliver, diag) {
         if (!passesFilters(t, filters)) continue;
         // v47c freshness gate: never spend classify budget on posts too old to deliver (see delivery loop)
         if (snowMs(id) < Date.now() - 20 * 60000) { retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), staleSkipped: true }); bsSeenAdd(bs, id); continue; }
+        try { if (isPreFilterJunk([t.text, t.origText, t.quotedText].filter(Boolean).join(" "))) { retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), preFiltered: true }); bsSeenAdd(bs, id); preFiltered++; continue; } } catch (e) {} // v47f
         if (isAlwaysDeliver(t.handle, acctRules)) continue; // v34: bypass accounts never classified
         try { // v36: dupe of an already-delivered story with no new media -> the in-loop check would drop it anyway; skip the judge call
           const hasMedia = (t.media || []).length > 0;
@@ -1118,7 +1131,7 @@ async function poll(env, maxDeliver, diag) {
   const forceSave = delivered > 0 && Date.now() - LAST_FORCE_SAVE > 120000; // v46: force-persist at most every 2 min on delivery ticks (was every delivery - KV write budget); regular 10-min throttle otherwise
   if (forceSave) LAST_FORCE_SAVE = Date.now();
   await saveBS(env, bs, forceSave);
-  return `delivered=${delivered} dropped=${dropped} skipped=${skipped} filtered=${filtered} deferred=${deferred} suppressed=${suppressed}${markerDupes ? ` markerdupes=${markerDupes}` : ""}${untranslated ? ` untr=${untranslated}` : ""}${storyDupes ? ` storydupes=${storyDupes}` : ""}${held ? ` held=${held}` : ""}${shabbos ? " shabbos" : ""}${paused ? " paused" : ""}${waDown ? " wa_down" : ""}`;
+  return `delivered=${delivered} dropped=${dropped} skipped=${skipped} filtered=${filtered} deferred=${deferred} suppressed=${suppressed}${markerDupes ? ` markerdupes=${markerDupes}` : ""}${preFiltered ? ` prefiltered=${preFiltered}` : ""}${untranslated ? ` untr=${untranslated}` : ""}${storyDupes ? ` storydupes=${storyDupes}` : ""}${held ? ` held=${held}` : ""}${shabbos ? " shabbos" : ""}${paused ? " paused" : ""}${waDown ? " wa_down" : ""}`;
 }
 
 // ---------- commands ----------
@@ -1433,7 +1446,11 @@ async function geminiClassify(env, keyIgnored, rules, mode, tweets, acctRules, r
         // Gemini lists several quota metrics in every 429, so a per-MINUTE burst parked a healthy key
         // until PT midnight (today's 4:28 PM false daily-cool, 3h of dead feed during a live event).
         // Daily only when a PerDay metric is present AND no PerMinute metric is (minute bursts cool 5 min).
-        const daily = /PerDay/i.test(lastBody) && !/PerMinute/i.test(lastBody);
+        // v47f: key on the actual exceeded quota detail - Google's 429 body carries the metric + limit
+        // ("...free_tier_requests, limit: 500, model: ..." is the daily pool; minute bursts carry a low
+        // limit). Threshold 100 sits between any RPM limit and the 500/day pool. v47d heuristic is the fallback.
+        const limM = lastBody.match(/free_tier_requests,\s*limit:\s*(\d+)/i);
+        const daily = limM ? Number(limM[1]) >= 100 : (/PerDay/i.test(lastBody) && !/PerMinute/i.test(lastBody));
         await gemKeyCool(env, kid, daily ? nextPTmidnight() : Date.now() + 5 * 60000, daily, lastBody);
         continue; // next key in the pool
       }
