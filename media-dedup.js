@@ -26,6 +26,18 @@ try { ({ Jimp } = await import('jimp')); } catch { console.error('[dedup] jimp u
 let ffmpegPath = process.env.FFMPEG_PATH || null;
 if (!ffmpegPath) { try { ffmpegPath = (await import('ffmpeg-static')).default; } catch { ffmpegPath = null; } }
 if (!ffmpegPath) ffmpegPath = 'ffmpeg'; // system binary, if any
+// v9 (Serv00/FreeBSD prep): ffmpeg-static ships no FreeBSD binary, so probe once at
+// startup. If ffmpeg can't run, video dedup degrades to text-only (fail-open per post)
+// instead of burning a 30s spawn timeout per video.
+let ffmpegOK = null;
+async function probeFFmpeg() {
+  try {
+    const r = await runFFmpeg(['-version']);
+    ffmpegOK = r.code === 0 && /ffmpeg version/i.test(r.stdout.toString() + r.stderr);
+  } catch { ffmpegOK = false; }
+  if (!ffmpegOK) console.error('[dedup] ffmpeg unavailable - video dedup disabled, text/image dedup continues (fail-open)');
+  else console.log('[dedup] ffmpeg OK at', ffmpegPath);
+}
 
 // hash hex (16 chars) -> { ts, kind, tag }
 const seen = new Map();
@@ -78,6 +90,7 @@ function runFFmpeg(args, inputBuf) {
 // 5 keyframe dHashes for a video buffer (v8: was 3); null when extraction impossible.
 // MP4 needs a seekable input (moov atom), so go through a temp file, not a pipe.
 async function videoHashes(buf) {
+  if (ffmpegOK === false) return null;
   const tmp = path.join(os.tmpdir(), 'dedup-' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.mp4');
   try {
     fs.writeFileSync(tmp, buf);
@@ -157,6 +170,7 @@ async function kvFlush(force) {
 }
 
 export async function initDedup() {
+  await probeFFmpeg();
   await kvRestore();
   setInterval(() => kvFlush(false), 15 * 60 * 1000).unref(); // v6: slow dirty flush; KV write budget safe (~4/hr max, only when dirty)
   const onExit = () => kvFlush(true).finally(() => process.exit(0));
@@ -178,7 +192,7 @@ export async function checkMedia({ imageUrl, videoUrl }) {
     // Skip hashing - fail-open (media still sends; worker-side byte-exact URL dedup still applies).
     const clen = Number(r.headers.get('content-length') || 0);
     if (kind === 'vid' && clen > 12 * 1024 * 1024) { stats.bigSkips = (stats.bigSkips || 0) + 1; console.log(`[dedup] SKIP big video ${(clen / 1048576).toFixed(1)}MB tag=${tag} (OOM guard)`); return { dupe: false }; }
-    if (process.memoryUsage().rss > 420 * 1024 * 1024) { stats.memSkips = (stats.memSkips || 0) + 1; console.log(`[dedup] SKIP hashing under memory pressure tag=${tag}`); return { dupe: false }; }
+    if (process.memoryUsage().rss > Number(process.env.MEM_SKIP_RSS_MB || 420) * 1024 * 1024) { stats.memSkips = (stats.memSkips || 0) + 1; console.log(`[dedup] SKIP hashing under memory pressure tag=${tag}`); return { dupe: false }; }
     const buf = Buffer.from(await r.arrayBuffer());
     if (kind === 'img') {
       const h = await dhashBuffer(buf);
@@ -210,5 +224,6 @@ export async function checkMedia({ imageUrl, videoUrl }) {
 }
 
 export function dedupStatus() {
-  return { enabled: !!Jimp, ffmpeg: !!ffmpegPath, size: seen.size, kv: { configured: !!(ACCOUNT && NAMESPACE && TOKEN), lastFlushOk, lastFlushAt, lastFlushErr }, ...stats };
+  return { enabled: !!Jimp, ffmpeg: ffmpegOK !== false, ffmpegPath, size: seen.size, kv: { configured: !!(ACCOUNT && NAMESPACE && TOKEN), lastFlushOk, lastFlushAt, lastFlushErr }, ...stats };
 }
+
