@@ -1,10 +1,3 @@
-// Buff Feed Bot v2 - X list timeline -> WhatsApp via buff-bridge (Cloudflare Worker, zero deps)
-// Delivery: linked-device bridge (Baileys on Render) via BRIDGE_URL - no Meta Cloud API.
-// Real-time only: posts that can't be delivered in the moment are DROPPED (no catch-up).
-// Privacy: never sends read receipts.
-// Required bindings: BUFF_KV (kv), X_LIST_ID (text), BRIDGE_URL (text), BRIDGE_SECRET (secret),
-//   ADMIN_PHONE (text, e.g. 14433793297). Optional: STRIP_HANDLES, X_AUTH_TOKEN, X_CT0, VERIFY_TOKEN.
-
 const X_BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
 const QID_LIST = "1LE3u14FJjPZUHKFGzos2g"; // ListLatestTweetsTimeline (seeded 2026-08-26)
 const X_FEATURES = {
@@ -396,16 +389,23 @@ async function sendShabbosDigest(env, opts) {
 // ---------- bridge delivery ----------
 
 async function bridgeSend(env, payload, to) {
-  const res = await fetch(`${env.BRIDGE_URL}/send`, {
-    method: "POST",
-    headers: { authorization: env.BRIDGE_SECRET, "content-type": "application/json" },
-    body: JSON.stringify({ ...payload, to }),
-    signal: AbortSignal.timeout(20000)
-  });
+  let res;
+  try {
+    res = await fetch(`${env.BRIDGE_URL}/send`, {
+      method: "POST",
+      headers: { authorization: env.BRIDGE_SECRET, "content-type": "application/json" },
+      body: JSON.stringify({ ...payload, to }),
+      signal: AbortSignal.timeout(20000)
+    });
+  } catch (e) {
+    const err = new Error(`bridge unreachable: ${e && e.message ? e.message : e}`);
+    err.bridgeDown = true; // v49: dead host (DNS fail / conn refused / timeout) counts as bridge down, same as a 503
+    throw err;
+  }
   const json = await res.json().catch(() => ({}));
   if (!res.ok) {
     const err = new Error(`bridge send HTTP ${res.status}: ${json.error || "?"}`);
-    err.bridgeDown = res.status === 503;
+    err.bridgeDown = res.status === 503 || res.status === 404 || res.status === 502 || res.status === 504; // v49b: 404/502/504 = hosting-platform placeholder or gateway, the bridge process is gone (dead-window 404 flushed 29 on 2026-09-10)
     throw err;
   }
   return json.id || null;
@@ -418,16 +418,23 @@ async function getSubscribers(env) {
 // v41: returns { id, mediaDupe } so caption-folding can tell when the bridge perceptually suppressed
 // the caption's carrier media and move the caption on. Other callers keep using bridgeSend directly.
 async function bridgeSendFull(env, payload, to) {
-  const res = await fetch(`${env.BRIDGE_URL}/send`, {
-    method: "POST",
-    headers: { authorization: env.BRIDGE_SECRET, "content-type": "application/json" },
-    body: JSON.stringify({ ...payload, to }),
-    signal: AbortSignal.timeout(20000)
-  });
+  let res;
+  try {
+    res = await fetch(`${env.BRIDGE_URL}/send`, {
+      method: "POST",
+      headers: { authorization: env.BRIDGE_SECRET, "content-type": "application/json" },
+      body: JSON.stringify({ ...payload, to }),
+      signal: AbortSignal.timeout(20000)
+    });
+  } catch (e) {
+    const err = new Error(`bridge unreachable: ${e && e.message ? e.message : e}`);
+    err.bridgeDown = true; // v49
+    throw err;
+  }
   const json = await res.json().catch(() => ({}));
   if (!res.ok) {
     const err = new Error(`bridge send HTTP ${res.status}: ${json.error || "?"}`);
-    err.bridgeDown = res.status === 503;
+    err.bridgeDown = res.status === 503 || res.status === 404 || res.status === 502 || res.status === 504; // v49b: 404/502/504 = hosting-platform placeholder or gateway, the bridge process is gone (dead-window 404 flushed 29 on 2026-09-10)
     throw err;
   }
   return json || {};
@@ -609,12 +616,12 @@ async function deliverTweet(env, t) {
   // Same caption-migration contract as before: mediaDupe in the response means every media was
   // suppressed, so the text still goes standalone.
   if (toSend.length) {
-    const payload = { mediaUrls: toSend.map((m) => ({ kind: m.kind, url: m.url })) };
+    const payload = { id: t.id, mediaUrls: toSend.map((m) => ({ kind: m.kind, url: m.url })) }; // v47g: id rides for bridge last-hop dedup
     if (caption) payload.text = caption;
     const r = await deliverToAll(env, payload);
     if (caption && !(r && r.mediaDupe)) caption = null;
   }
-  if (caption || !fold) await deliverToAll(env, { text: body });
+  if (caption || !fold) await deliverToAll(env, { id: t.id, text: body }); // v47g
   return { suppressed, untranslated: 0 };
 }
 
@@ -874,13 +881,14 @@ async function poll(env, maxDeliver, diag) {
 
   const paused = !!(await env.BUFF_KV.get("feed_paused"));
   let waDown = await env.BUFF_KV.get("wa_down");
+  const reconnectAt = Number(await env.BUFF_KV.get("wa_reconnect_at")) || 0; // v49
   // v31: per-tick bridge keep-alive + breaker auto-clear. Keeps the Render free-tier instance
   // warm through news lulls (15-min idle spindown was the 2026-09-06 4:10 PM silence), and a
   // healthy response clears wa_down so a mid-restart 503 costs ~1 min, not the 1h TTL.
   try {
     const hp = await fetch(env.BRIDGE_URL + "/health", { signal: AbortSignal.timeout(6000) });
     const hj = await hp.json().catch(() => ({}));
-    if (hp.ok && hj.connected && waDown) { await env.BUFF_KV.delete("wa_down"); waDown = null; }
+    if (hp.ok && hj.connected && waDown) { await env.BUFF_KV.delete("wa_down"); await kvPut(env, "wa_reconnect_at", String(Date.now()), { expirationTtl: 1500 }); waDown = null; } // v49: stamp reconnect time - nothing posted before it may deliver
   } catch (e) { /* bridge unreachable - leave breaker state as-is */ }
 
   const unseen = [];
@@ -951,6 +959,7 @@ async function poll(env, maxDeliver, diag) {
         if (!t) continue;
         if (t.replyToUserId && t.authorId && t.replyToUserId !== t.authorId) continue;
         if (!passesFilters(t, filters)) continue;
+        if (reconnectAt && snowMs(id) < reconnectAt) continue; // v49: pre-reconnect posts are dropped in the delivery loop - don't spend classify budget on them
         // v47c freshness gate: never spend classify budget on posts too old to deliver (see delivery loop)
         if (snowMs(id) < Date.now() - 20 * 60000) { retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), staleSkipped: true }); bsSeenAdd(bs, id); continue; }
         try { if (isPreFilterJunk([t.text, t.origText, t.quotedText].filter(Boolean).join(" "))) { retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), preFiltered: true }); bsSeenAdd(bs, id); preFiltered++; continue; } } catch (e) {} // v47f
@@ -1037,6 +1046,12 @@ async function poll(env, maxDeliver, diag) {
       deferred++;
       continue;
     }
+    if (reconnectAt && snowMs(id) < reconnectAt) { // v49: posted before the bridge came back - resume from NOW, no catch-up flush at any outage length (Ezra 2026-09-10)
+      retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), preReconnect: true });
+      bsSeenAdd(bs, id);
+      deferred++;
+      continue;
+    }
     if (shabbos) {
       // hold: buffer what passed the filter for the end-of-Shabbos digest; mark seen so live delivery resumes from NOW
       retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), held: true });
@@ -1070,6 +1085,7 @@ async function poll(env, maxDeliver, diag) {
     // could both deliver the same id minutes apart. Per-id KV marker: checked right before send,
     // written right after. Edge cache bounds the residual window to ~60s.
     try { if (await env.BUFF_KV.get("sent_" + id)) { bsSeenAdd(bs, id); markerDupes++; continue; } } catch (e) {}
+    try { await env.BUFF_KV.put("sent_" + id, "1", { expirationTtl: 86400 }); } catch (e) {} // v47g mark-BEFORE-send: closes the overlapping-execution window (Herzog dup 2026-09-09)
     try {
       const dres = await deliverTweet(env, t);
       suppressed += dres.suppressed;
@@ -1087,7 +1103,6 @@ async function poll(env, maxDeliver, diag) {
       }
       bsSeenAdd(bs, id); // mark seen only AFTER successful send
       delivered++;
-      try { await env.BUFF_KV.put("sent_" + id, "1", { expirationTtl: 86400 }); } catch (e) {} // v47e
       try { // rolling "already delivered" memory for the gatekeeper (restatement-drop context)
         bs.recentDel = bs.recentDel || [];
         bs.recentDel.push({ t: String(t.text || t.origText || "").replace(/\s+/g, " ").slice(0, 140), at: Date.now() });
@@ -1096,9 +1111,12 @@ async function poll(env, maxDeliver, diag) {
       } catch (e) {}
       await sleep(250);
     } catch (e) {
+      try { await env.BUFF_KV.delete("sent_" + id); } catch (e2) {} // v47g: undo mark-before-send so the item can retry
       if (e.bridgeDown) {
-        // bridge not connected: trip circuit breaker, defer everything unsent
+        // bridge down: trip circuit breaker, mark SEEN + retain - on reconnect the feed resumes from NOW; this post must never flush later (v49, Ezra's no-backlog rule 2026-09-10)
         await kvPut(env, "wa_down", String(Date.now()), { expirationTtl: 3600 });
+        retained.push({ id: t.id, kind: t.kind, text: t.text, media: t.media, handle: t.handle, name: t.name, origHandle: t.origHandle, origName: t.origName, origText: t.origText, quotedHandle: t.quotedHandle, quotedName: t.quotedName, quotedText: t.quotedText, at: Date.now(), bridgeDown: true });
+        bsSeenAdd(bs, id);
         deferred++;
         break;
       }
@@ -2065,3 +2083,4 @@ export default {
     return new Response("buff", { status: 200 });
   }
 };
+
